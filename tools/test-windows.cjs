@@ -19,6 +19,7 @@ const arch=process.argv[2]||'amd64',root=path.resolve(__dirname,'..'),dir=path.j
   const stateFile=path.join(dir,'Blink','profiles.dpapi');assert(fs.existsSync(stateFile));assert(!fs.readFileSync(stateFile).includes(Buffer.from('00000000-0000-4000-8000-000000000001')));
   await page.locator('[data-page=settings]').click();await page.locator('#server-defaults').uncheck();await page.locator('#turn-transport').selectOption('tcp');await page.locator('#settings-form button[type=submit]').click();await page.locator('#toast').filter({hasText:'Настройки сохранены'}).waitFor();
   assert.equal((await page.evaluate(()=>window.go.main.Application.Snapshot())).turn.transport,'tcp');
+  const log=path.join(dir,'Blink','logs','blink.log');assert.equal((await page.evaluate(()=>window.go.main.Application.Snapshot())).logPath.toLowerCase(),log.toLowerCase());assert(fs.existsSync(log));const journal=fs.readFileSync(log,'utf8');assert(JSON.parse(journal.trim().split('\n')[0]).event==='app.start');assert(!journal.includes('00000000-0000-4000-8000-000000000001'));assert(!journal.includes('vpn.example.org'));
   await page.locator('[data-page=home]').click();await page.screenshot({path:path.join(dir,'windows-ui.png')});
   console.log(`Windows ${arch}: real WebView2, Go bindings, independent TURN/VPN imports, saved selections, DPAPI write, settings save, and screenshot passed. No VPN started.`);
  }finally{if(browser)await browser.close();if(child.pid)try{require('child_process').execFileSync('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore'})}catch{}}

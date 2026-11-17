@@ -20,6 +20,7 @@ import (
 	"unsafe"
 
 	"github.com/remzone/blink_windows/internal/client"
+	"github.com/remzone/blink_windows/internal/diagnostics"
 	"github.com/remzone/blink_windows/internal/platform"
 	"github.com/remzone/blink_windows/native/mobile"
 	"github.com/wailsapp/wails/v2"
@@ -33,7 +34,7 @@ import (
 //go:embed ui/*
 var assets embed.FS
 
-const version = "0.3.0-preview.1"
+const version = "0.3.0-preview.2"
 
 type SourceView struct {
 	ID          string `json:"id"`
@@ -53,6 +54,8 @@ type ProfileView struct {
 	Routing   bool   `json:"routing"`
 }
 type View struct {
+	LogPath         string                 `json:"logPath"`
+	LogError        string                 `json:"logError"`
 	Sources         []SourceView           `json:"sources"`
 	Selections      map[string]int         `json:"selections"`
 	Connection      client.ConnectionTrace `json:"connection"`
@@ -113,7 +116,12 @@ func (a *Application) Snapshot() View {
 	if trace.StartedAt > 0 && trace.Stage != "failed" && trace.Stage != "disconnected" {
 		trace.ElapsedSeconds = (time.Now().UnixMilli() - trace.StartedAt) / 1000
 	}
-	v := View{Sources: []SourceView{}, Connection: trace, Selections: map[string]int{"vpn": a.state.PreferredIndex("vpn"), "turn": a.state.PreferredIndex("turn")}, ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, TURN: vk, Routing: route, Captcha: a.challenge}
+	logPath, logErr := diagnostics.Status()
+	logError := ""
+	if logErr != nil {
+		logError = "Не удалось записать журнал. Проверьте доступ к папке Blink и свободное место."
+	}
+	v := View{LogPath: logPath, LogError: logError, Sources: []SourceView{}, Connection: trace, Selections: map[string]int{"vpn": a.state.PreferredIndex("vpn"), "turn": a.state.PreferredIndex("turn")}, ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, TURN: vk, Routing: route, Captcha: a.challenge}
 	for i, p := range a.state.Profiles {
 		kind := p.Kind
 		if kind == "vk" {
@@ -567,6 +575,22 @@ func (a *Application) CopyConnectionReport() error {
 	return runtime.ClipboardSetText(ctx, report)
 }
 
+// Open only our local log directory, never an imported path or external URL.
+func (a *Application) OpenLogFolder() error {
+	path, err := diagnostics.Status()
+	if path == "" {
+		return errors.New("Журнал не создан. Перезапустите Blink")
+	}
+	folder, _ := windows.UTF16PtrFromString(filepath.Dir(path))
+	if e := windows.ShellExecute(0, nil, folder, nil, nil, windows.SW_SHOWNORMAL); e != nil {
+		return errors.New("Не удалось открыть папку журнала. Откройте %APPDATA%\\Blink\\logs вручную")
+	}
+	if err != nil {
+		return errors.New("В журнале произошла ошибка записи. Проверьте свободное место в папке Blink")
+	}
+	return nil
+}
+
 func (a *Application) Disconnect() error { return a.disconnect(nil, "", "") }
 func (a *Application) disconnect(expected *platform.Tunnel, code, message string) error {
 	a.mu.Lock()
@@ -662,7 +686,9 @@ func (a *Application) Recover() error {
 		return err
 	}
 	a.emit()
+	diagnostics.Event("recovery.manual", nil)
 	err := platform.Recover()
+	diagnostics.Event("recovery.result", map[string]any{"ok": err == nil})
 	if err != nil {
 		a.finish(err.Error())
 		return err
@@ -732,15 +758,27 @@ func main() {
 		return
 	}
 	defer windows.CloseHandle(mutex)
-	if len(os.Args) > 1 && os.Args[1] == "--recover" {
-		if err := platform.Recover(); err != nil {
-			dialog(err.Error())
-		}
-		return
-	}
 	dir, err := platform.DataDir()
 	if err != nil {
 		dialog(err.Error())
+		return
+	}
+	journal, err := diagnostics.Open(filepath.Join(dir, "logs", "blink.log"))
+	if err != nil {
+		dialog("Не удалось создать журнал %APPDATA%\\Blink\\logs\\blink.log. Проверьте доступ к папке и свободное место.")
+		return
+	}
+	diagnostics.Set(journal)
+	defer func() { diagnostics.Event("app.stop", nil); diagnostics.Set(nil); _ = journal.Close() }()
+	osv := windows.RtlGetVersion()
+	diagnostics.Event("app.start", map[string]any{"version": version, "arch": goruntime.GOARCH, "pid": os.Getpid(), "admin": platform.Admin(), "windowsMajor": osv.MajorVersion, "windowsMinor": osv.MinorVersion, "windowsBuild": osv.BuildNumber})
+	if len(os.Args) > 1 && os.Args[1] == "--recover" {
+		diagnostics.Event("recovery.command", nil)
+		err := platform.Recover()
+		diagnostics.Event("recovery.result", map[string]any{"ok": err == nil})
+		if err != nil {
+			dialog(err.Error())
+		}
 		return
 	}
 	if err = mobile.PrepareAssets(filepath.Join(dir, "assets")); err != nil {

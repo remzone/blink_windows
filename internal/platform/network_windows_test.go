@@ -2,6 +2,7 @@
 package platform
 
 import (
+	"errors"
 	"github.com/remzone/blink_windows/internal/client"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -86,5 +87,45 @@ func TestNetworkFailureExportsOnlyKnownStepAndNumericHRESULT(t *testing.T) {
 	failure.Stderr = []byte("BLINK_STEP=private-token;BLINK_HRESULT=5")
 	if strings.Contains(networkConfigurationError(failure).Error(), "private") {
 		t.Fatal("unknown step leaked")
+	}
+}
+
+// Real PowerShell parser with mocked cmdlets: these tests never change the host network.
+func TestCleanupWithoutRulesOrAddressesIsSuccessful(t *testing.T) {
+	mock := `
+ function Get-DnsClientNrptRule {}
+ function Clear-DnsClientCache {throw 'cache must not be touched without rules'}
+ function Get-NetFirewallRule {[pscustomobject]@{Name='OtherVPN'}}
+ function Get-NetAdapter {[pscustomobject]@{Name='Blink';ifIndex=1234};[pscustomobject]@{Name='Ethernet';ifIndex=9}}
+ function Set-DnsClientServerAddress {param($InterfaceIndex,[switch]$ResetServerAddresses,$ErrorAction) if($InterfaceIndex -ne 1234){throw 'wrong adapter'}}
+ function Get-NetIPAddress {}
+ function Get-NetRoute {}
+ function Remove-DnsClientNrptRule {throw 'nothing to delete'}
+ function Remove-NetFirewallRule {throw 'wrong firewall rule'}
+ function Remove-NetIPAddress {throw 'nothing to delete'}
+ function Remove-NetRoute {throw 'nothing to delete'}
+ `
+	if _, err := powershell(mock + cleanupScript); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupKeepsFailingStepAndAttemptsOtherSteps(t *testing.T) {
+	mock := `
+ function Get-DnsClientNrptRule {throw [System.UnauthorizedAccessException]::new('sensitive error text')}
+ function Get-NetFirewallRule {}
+ function Get-NetAdapter {}
+ `
+	_, err := powershell(mock + cleanupScript)
+	var failure *exec.ExitError
+	if !errors.As(err, &failure) {
+		t.Fatalf("expected failure: %v", err)
+	}
+	events := cleanupEvents(failure.Stderr)
+	if len(events) != 4 || events[0].OK || events[0].Step != "nrpt" || !events[2].OK || !events[3].OK {
+		t.Fatalf("%+v", events)
+	}
+	if strings.Contains(cleanupError(err).Error(), "sensitive") {
+		t.Fatal("raw stderr escaped")
 	}
 }

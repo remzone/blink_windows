@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/remzone/blink_windows/internal/diagnostics"
 )
 
 type ConnectionEvent struct {
@@ -33,6 +35,7 @@ func (t *ConnectionTrace) add(code string, fields map[string]int64, now time.Tim
 		t.Events = append([]ConnectionEvent(nil), t.Events[len(t.Events)-99:]...)
 	}
 	t.Events = append(t.Events, ConnectionEvent{At: now.UnixMilli() - t.StartedAt, Code: code, Fields: fields})
+	diagnostics.Event(code, map[string]any{"attemptStartedAt": t.StartedAt, "elapsedMs": now.UnixMilli() - t.StartedAt, "values": fields})
 }
 func (t *ConnectionTrace) SetStage(stage string, now time.Time) {
 	if stage == "network" || stage == "connected" {
@@ -54,6 +57,7 @@ func (t *ConnectionTrace) Fail(code, message string, now time.Time) {
 	t.Stage = "failed"
 	t.Detail = message
 	t.add("windows.failed", nil, now)
+	diagnostics.Event("connection.failure", map[string]any{"code": code, "attemptStartedAt": t.StartedAt})
 }
 
 // Only known event IDs and numeric fields cross into the UI/report. The native

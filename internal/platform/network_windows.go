@@ -2,6 +2,7 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -21,6 +22,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/remzone/blink_windows/internal/client"
+	"github.com/remzone/blink_windows/internal/diagnostics"
 	"github.com/remzone/blink_windows/native/mobile"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
@@ -47,7 +49,38 @@ func powershellContext(parent context.Context, script string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, exe, "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(b))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	// Keep PowerShell progress/CLIXML on stderr out of successful stdout.
-	out, err := cmd.Output()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.WaitDelay = 2 * time.Second
+	operation := "configure"
+	if script == cleanupScript {
+		operation = "cleanup"
+	}
+	started := time.Now()
+	diagnostics.Event("windows.powershell.start", map[string]any{"operation": operation})
+	err = cmd.Run()
+	out := stdout.Bytes()
+	if failure, ok := err.(*exec.ExitError); ok {
+		failure.Stderr = stderr.Bytes()
+	}
+	if script == cleanupScript {
+		recordCleanup(stderr.Bytes())
+	}
+	fields := map[string]any{"operation": operation, "elapsedMs": time.Since(started).Milliseconds(), "ok": err == nil, "timeout": ctx.Err() == context.DeadlineExceeded, "cancelled": ctx.Err() == context.Canceled}
+	if cmd.ProcessState != nil {
+		fields["exitCode"] = cmd.ProcessState.ExitCode()
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		fields["win32"] = uint32(errno)
+	}
+	if script != cleanupScript {
+		if match := networkMarker.FindSubmatch(stderr.Bytes()); len(match) == 3 {
+			fields["step"] = string(match[1])
+			fields["hresult"], _ = strconv.ParseInt(string(match[2]), 10, 64)
+		}
+	}
+	diagnostics.Event("windows.powershell.finish", fields)
 	if ctx.Err() != nil {
 		return out, ctx.Err()
 	}
@@ -173,7 +206,7 @@ func start(ctx context.Context, p client.Profile, report func(string)) (*Tunnel,
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
-		return nil, errors.New("Windows не очистила прежние правила Blink. Выполните восстановление сети в настройках и сохраните отчёт")
+		return nil, cleanupError(err)
 	}
 	report("adapter")
 	index, err := defaultInterface(windows.AF_INET)
@@ -308,20 +341,6 @@ func (t *Tunnel) readPackets() {
 	}
 }
 
-// Cleanup attempts every independent operation, even if a policy denies one of them.
-const cleanupScript = `
-$failures=@();
-try {Get-DnsClientNrptRule | Where-Object {$_.Comment -eq 'Blink.Windows temporary'} | Remove-DnsClientNrptRule -Force;Clear-DnsClientCache} catch {$failures+='DNS'};
-try {$r=Get-NetFirewallRule -Name 'Blink-IPv6' -PolicyStore PersistentStore -ErrorAction SilentlyContinue;if($r){$r | Remove-NetFirewallRule}} catch {$failures+='Firewall'};
-$a=Get-NetAdapter -Name 'Blink' -ErrorAction SilentlyContinue;
-if($a){
- try {Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses} catch {$failures+='Adapter DNS'};
- try {Get-NetIPAddress -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false} catch {$failures+='Addresses'};
- try {Get-NetRoute -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue | Where-Object {$_.Protocol -eq 'NetMgmt'} | Remove-NetRoute -Confirm:$false} catch {$failures+='Routes'};
-};
-if($failures.Count){throw ('Blink cleanup failed: '+($failures -join ', '))}
-`
-
 func (t *Tunnel) Close() error {
 	var result error
 	t.once.Do(func() {
@@ -342,7 +361,7 @@ func Recover() error {
 	}
 	_, err := powershell(cleanupScript)
 	if err != nil {
-		return errors.New("Не удалось очистить все настройки Blink; проверьте права администратора и сетевые политики Windows")
+		return cleanupError(err)
 	}
 	return nil
 }
@@ -401,4 +420,15 @@ func networkConfigurationError(err error) error {
 		}
 	}
 	return errors.New("Не удалось настроить адреса, DNS, маршруты или IPv6-фильтр; подключение отменено")
+}
+
+func cleanupError(err error) error {
+	var failure *exec.ExitError
+	if errors.As(err, &failure) {
+		return cleanupFailure(failure.Stderr)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("Очистка Blink не завершилась за 30 секунд. Подробности — в файле журнала в разделе «Диагностика»")
+	}
+	return cleanupFailure(nil)
 }
