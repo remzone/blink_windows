@@ -43,3 +43,13 @@ func TestConnectionTraceIsBoundedAndExplainsWindowsStartup(t *testing.T) {
 		t.Fatal(trace)
 	}
 }
+
+func TestXrayLogSeverityDoesNotMislabelStartupWarningAsFailure(t *testing.T) {
+	now := time.Now()
+	trace := NewConnectionTrace(now)
+	trace.SetStage("network", now)
+	trace.Consume(`[{"event":"native.xray.error","fields":{"stage":0,"errorCode":2,"count":1}},{"event":"native.xray.error","fields":{"stage":1,"errorCode":1,"count":1}},{"event":"native.xray.error","fields":{"stage":1,"errorCode":3,"count":1}}]`, now)
+	if trace.Events[1].Code != "vpn.core_warning" || trace.Events[2].Code != "vpn.core_error" || trace.Events[3].Code != "vpn.core_info" || trace.Stage != "network" || trace.Error != "" {
+		t.Fatalf("incorrect severity: %+v", trace)
+	}
+}

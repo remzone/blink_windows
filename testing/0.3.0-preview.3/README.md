@@ -1,8 +1,8 @@
-# Диагностический preview 0.3.0-preview.2
+# Диагностический preview 0.3.0-preview.3
 
-Это **не подтверждённый рабочий релиз**. Архивы 0.2.x отозваны после сообщения о зависании обоих типов подключения. Preview исправляет хранение независимых подписок, отмену/ограничение ожидания и добавляет отчёт для выяснения причины на Windows.
+Это **не подтверждённый рабочий релиз**. Архивы 0.2.x отозваны после сообщения о зависании обоих типов подключения. Preview.3 исправляет адресный параметр IPv6-фильтра Firewall после успешной очистки, сохраняя независимые подписки, отмену и файловый журнал. Работа реального подключения после исправления требует повторной проверки на Windows.
 
-[Скачать x64](https://github.com/remzone/blink_windows/raw/refs/heads/main/testing/0.3.0-preview.2/Blink-Windows-0.3.0-preview.2-x64.zip) · [Скачать x86, 32 бит](https://github.com/remzone/blink_windows/raw/refs/heads/main/testing/0.3.0-preview.2/Blink-Windows-0.3.0-preview.2-x86.zip) · [SHA256SUMS](SHA256SUMS)
+[Скачать x64](https://github.com/remzone/blink_windows/raw/refs/heads/main/testing/0.3.0-preview.3/Blink-Windows-0.3.0-preview.3-x64.zip) · [Скачать x86, 32 бит](https://github.com/remzone/blink_windows/raw/refs/heads/main/testing/0.3.0-preview.3/Blink-Windows-0.3.0-preview.3-x86.zip) · [SHA256SUMS](SHA256SUMS)
 
 1. Распакуйте архив целиком; EXE и Wintun DLL должны лежать рядом. Нужен WebView2 Runtime.
 2. Добавьте обычную VPN-подписку и TURN-подписку: в этой версии они сохраняются независимо. Существующая сохранившаяся подписка мигрирует; ранее удалённую старым импортом нужно добавить повторно.

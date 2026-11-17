@@ -81,6 +81,16 @@ func (t *ConnectionTrace) Consume(raw string, now time.Time) {
 		if !ok {
 			continue
 		}
+		// The native field is the Xray log severity, not a Windows error code.
+		// Xray also emits its normal startup message at Warning (2).
+		if row.Event == "native.xray.error" {
+			switch row.Fields["errorCode"] {
+			case 2:
+				code = "vpn.core_warning"
+			case 3:
+				code = "vpn.core_info"
+			}
+		}
 		fields := map[string]int64{}
 		for k, v := range row.Fields {
 			if allowed[k] {

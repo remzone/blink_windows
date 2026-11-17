@@ -220,7 +220,7 @@ func Fetch(ctx context.Context, rawURL string) (string, error) {
 		return "", errors.New("Некорректная ссылка")
 	}
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "Blink-Windows/0.3.0-preview.2")
+	req.Header.Set("User-Agent", "Blink-Windows/0.3.0-preview.3")
 	res, err := c.Do(req)
 	if err != nil {
 		return "", errors.New("Не удалось загрузить подписку по HTTPS")

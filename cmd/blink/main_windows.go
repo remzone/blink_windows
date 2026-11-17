@@ -34,7 +34,7 @@ import (
 //go:embed ui/*
 var assets embed.FS
 
-const version = "0.3.0-preview.2"
+const version = "0.3.0-preview.3"
 
 type SourceView struct {
 	ID          string `json:"id"`

@@ -10,7 +10,7 @@ import (
 	"github.com/remzone/blink_windows/internal/diagnostics"
 )
 
-type cleanupEvent struct {
+type shellEvent struct {
 	Step         string `json:"step"`
 	OK           bool   `json:"ok"`
 	Count        int    `json:"count"`
@@ -23,19 +23,29 @@ type cleanupEvent struct {
 }
 
 var cleanupLabels = map[string]string{"nrpt": "правила DNS (NRPT)", "cache": "кэш DNS", "firewall": "брандмауэр", "adapter": "поиск адаптера", "adapter_dns": "DNS адаптера", "addresses": "адреса адаптера", "routes": "маршруты адаптера"}
-var technicalID = regexp.MustCompile(`^[A-Za-z0-9_.,:+-]{1,192}$`)
+var technicalID = regexp.MustCompile(`^[A-Za-z0-9_.,:+ -]{1,192}$`)
 
 // Only our ASCII JSON markers are accepted. PowerShell's raw CLIXML and error
 // messages may contain arbitrary profile data and are never written to disk.
-func cleanupEvents(raw []byte) []cleanupEvent {
-	var events []cleanupEvent
+func cleanupEvents(raw []byte) []shellEvent {
+	return parseShellEvents(raw, "BLINK_CLEANUP ", cleanupLabels)
+}
+
+func networkEvents(raw []byte) []shellEvent {
+	return parseShellEvents(raw, "BLINK_NETWORK ", networkLabels)
+}
+
+var networkLabels = map[string]string{"adapter": "сетевой адаптер", "binding": "привязки IPv4/IPv6", "mtu": "MTU", "address": "адрес интерфейса", "dns": "DNS", "route": "маршруты", "nrpt": "правило системного DNS", "firewall": "правило IPv6-фильтра"}
+
+func parseShellEvents(raw []byte, prefix string, labels map[string]string) []shellEvent {
+	var events []shellEvent
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "BLINK_CLEANUP ") || len(line) > 4096 {
+		if !strings.HasPrefix(line, prefix) || len(line) > 4096 {
 			continue
 		}
-		var e cleanupEvent
-		if json.Unmarshal([]byte(strings.TrimPrefix(line, "BLINK_CLEANUP ")), &e) != nil || cleanupLabels[e.Step] == "" {
+		var e shellEvent
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &e) != nil || labels[e.Step] == "" {
 			continue
 		}
 		for _, id := range []*string{&e.ErrorID, &e.Category, &e.Exception} {
@@ -73,7 +83,16 @@ func cleanupFailure(raw []byte) error {
 // Empty selections are successful. Missing named CIM objects must not become
 // terminating errors; enumerate and filter rather than query by a missing name.
 // Every independent step still runs after a failure. No physical adapter changes.
-const cleanupScript = `
+const shellErrorFunction = `
+function Write-BlinkError($prefix,$step,$record) {
+ $native=0;$inner=0;
+ if($record.Exception.PSObject.Properties['NativeErrorCode']){$native=[long]$record.Exception.NativeErrorCode};
+ if($record.Exception.InnerException){$inner=[long]$record.Exception.InnerException.HResult};
+ [Console]::Error.WriteLine(($prefix+' '+(@{step=$step;ok=$false;count=0;hresult=[long]$record.Exception.HResult;nativeError=$native;innerHresult=$inner;errorId=$record.FullyQualifiedErrorId;category=[string]$record.CategoryInfo.Category;exception=$record.Exception.GetType().FullName}|ConvertTo-Json -Compress)));
+};
+`
+
+const cleanupScript = shellErrorFunction + `
 $script:blinkFailures=0;
 function Invoke-BlinkCleanup($step, [scriptblock]$action) {
  try {
@@ -81,10 +100,7 @@ function Invoke-BlinkCleanup($step, [scriptblock]$action) {
   [Console]::Error.WriteLine(('BLINK_CLEANUP '+(@{step=$step;ok=$true;count=[int]$n;hresult=0}|ConvertTo-Json -Compress)));
  } catch {
   $script:blinkFailures++;
-  $native=0;$inner=0;
-  if($_.Exception.PSObject.Properties['NativeErrorCode']){$native=[long]$_.Exception.NativeErrorCode};
-  if($_.Exception.InnerException){$inner=[long]$_.Exception.InnerException.HResult};
-  [Console]::Error.WriteLine(('BLINK_CLEANUP '+(@{step=$step;ok=$false;count=0;hresult=[long]$_.Exception.HResult;nativeError=$native;innerHresult=$inner;errorId=$_.FullyQualifiedErrorId;category=[string]$_.CategoryInfo.Category;exception=$_.Exception.GetType().FullName}|ConvertTo-Json -Compress)));
+  Write-BlinkError 'BLINK_CLEANUP' $step $_;
  }
 };
 $script:blinkRulesRemoved=0;

@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -75,6 +74,9 @@ func powershellContext(parent context.Context, script string) ([]byte, error) {
 		fields["win32"] = uint32(errno)
 	}
 	if script != cleanupScript {
+		for _, e := range networkEvents(stderr.Bytes()) {
+			diagnostics.Event("windows.network.step", e)
+		}
 		if match := networkMarker.FindSubmatch(stderr.Bytes()); len(match) == 3 {
 			fields["step"] = string(match[1])
 			fields["hresult"], _ = strconv.ParseInt(string(match[2]), 10, 64)
@@ -126,15 +128,6 @@ func (t *Tunnel) WritePacket(b []byte) bool {
 	return err == nil
 }
 
-func hasIPv6(p client.Profile) bool {
-	for _, s := range p.Addresses {
-		a, e := netip.ParsePrefix(s)
-		if e == nil && a.Addr().Is6() {
-			return true
-		}
-	}
-	return false
-}
 func validateNetwork(p client.Profile) error {
 	if p.MTU < 576 || p.MTU > 9000 || len(p.Addresses) == 0 || len(p.Routes) == 0 || len(p.DNS) == 0 {
 		return errors.New("Профиль должен задавать адреса, маршруты и DNS")
@@ -266,56 +259,7 @@ func (t *Tunnel) Configure(ctx context.Context, p client.Profile) error {
 	if err := validateNetwork(p); err != nil {
 		return err
 	}
-	script := `$blinkStep='adapter';$a=Get-NetAdapter -Name 'Blink';$i=$a.ifIndex;Get-NetRoute -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;Get-NetIPAddress -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;`
-	if hasIPv6(p) {
-		script += `$blinkStep='binding';Enable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv6 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
-	} else {
-		script += `$blinkStep='binding';Disable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;`
-	}
-	script += `$blinkStep='mtu';Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
-	for _, raw := range p.Addresses {
-		prefix, _ := netip.ParsePrefix(raw)
-		family := "IPv4"
-		if prefix.Addr().Is6() {
-			family = "IPv6"
-		}
-		script += fmt.Sprintf("$blinkStep='address';New-NetIPAddress -InterfaceIndex $i -IPAddress '%s' -PrefixLength %d -AddressFamily %s | Out-Null;", prefix.Addr(), prefix.Bits(), family)
-	}
-	dns := []string{}
-	for _, d := range p.DNS {
-		dns = append(dns, "'"+d+"'")
-	}
-	script += "$blinkStep='dns';Set-DnsClientServerAddress -InterfaceIndex $i -ServerAddresses @(" + strings.Join(dns, ",") + ");"
-	for _, r := range p.Routes {
-		routes := []string{r}
-		if r == "0.0.0.0/0" {
-			routes = []string{"0.0.0.0/1", "128.0.0.0/1"}
-		} else if r == "::/0" {
-			routes = []string{"::/1", "8000::/1"}
-		}
-		for _, route := range routes {
-			nextHop := "0.0.0.0"
-			prefix, _ := netip.ParsePrefix(route)
-			if prefix.Addr().Is6() {
-				nextHop = "::"
-			}
-			script += "$blinkStep='route';New-NetRoute -InterfaceIndex $i -DestinationPrefix '" + route + "' -NextHop '" + nextHop + "' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null;"
-		}
-	}
-
-	full := false
-	for _, r := range p.Routes {
-		if r == "0.0.0.0/0" || r == "::/0" {
-			full = true
-		}
-	}
-	if full {
-		script += "$blinkStep='nrpt';Add-DnsClientNrptRule -Namespace '.' -NameServers @(" + strings.Join(dns, ",") + ") -Comment 'Blink.Windows temporary';Clear-DnsClientCache;"
-		if !hasIPv6(p) {
-			script += `$blinkStep='firewall';New-NetFirewallRule -Name 'Blink-IPv6' -DisplayName 'Blink IPv6 while connected' -Direction Outbound -Action Block -RemoteAddress '::/0' -PolicyStore PersistentStore | Out-Null;`
-		}
-	}
-	script = "try {" + script + `} catch {[Console]::Error.WriteLine(('BLINK_STEP='+$blinkStep+';BLINK_HRESULT='+$_.Exception.HResult));exit 1}`
+	script := buildNetworkScript(p)
 	if _, err := powershellContext(ctx, script); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return errors.New("Windows не применила адреса, DNS, маршруты или IPv6-фильтр за 30 секунд. Подключение отменено")
@@ -410,12 +354,24 @@ var networkMarker = regexp.MustCompile(`BLINK_STEP=(adapter|binding|mtu|address|
 func networkConfigurationError(err error) error {
 	var failure *exec.ExitError
 	if errors.As(err, &failure) {
+		for _, e := range networkEvents(failure.Stderr) {
+			if !e.OK {
+				code := fmt.Sprintf("HRESULT 0x%08X", uint32(e.HRESULT))
+				if e.NativeError != 0 {
+					code += fmt.Sprintf(", CIM %d", e.NativeError)
+				}
+				if e.InnerHRESULT != 0 {
+					code += fmt.Sprintf(", внутренний HRESULT 0x%08X", uint32(e.InnerHRESULT))
+				}
+				return fmt.Errorf("Windows не настроила %s (%s). Подключение отменено; подробности — в файле журнала", networkLabels[e.Step], code)
+			}
+		}
 		match := networkMarker.FindSubmatch(failure.Stderr)
 		if len(match) == 3 {
 			number, e := strconv.ParseInt(string(match[2]), 10, 64)
 			if e == nil {
-				labels := map[string]string{"adapter": "сетевой адаптер", "binding": "привязки IPv4/IPv6", "mtu": "MTU", "address": "адрес интерфейса", "dns": "DNS", "route": "маршруты", "nrpt": "правило системного DNS", "firewall": "правило IPv6-фильтра"}
-				return fmt.Errorf("Windows не настроила %s (HRESULT 0x%08X). Подключение отменено", labels[string(match[1])], uint32(number))
+
+				return fmt.Errorf("Windows не настроила %s (HRESULT 0x%08X). Подключение отменено", networkLabels[string(match[1])], uint32(number))
 			}
 		}
 	}

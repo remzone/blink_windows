@@ -129,3 +129,51 @@ func TestCleanupKeepsFailingStepAndAttemptsOtherSteps(t *testing.T) {
 		t.Fatal("raw stderr escaped")
 	}
 }
+
+// Invoke the generated production script with inert mock cmdlets: validate the
+// rule's family, action and scope without adding any rule to the host firewall.
+func TestNetworkScriptPowerShellBindingAndFailureMetadata(t *testing.T) {
+	mock := `
+ function Get-NetAdapter {[pscustomobject]@{ifIndex=1234}}
+ function Get-NetRoute {}
+ function Get-NetIPAddress {}
+ function Disable-NetAdapterBinding {}
+ function Set-NetIPInterface {}
+ function New-NetIPAddress {}
+ function Set-DnsClientServerAddress {}
+ function New-NetRoute {}
+ function Add-DnsClientNrptRule {}
+ function Clear-DnsClientCache {}
+ function New-NetFirewallRule {
+  [CmdletBinding()]param(
+   [ValidateSet('Any6')][string]$RemoteAddress,
+   [ValidateSet('Blink-IPv6')][string]$Name,
+   [string]$DisplayName,
+   [ValidateSet('Outbound')][string]$Direction,
+   [ValidateSet('Block')][string]$Action,
+   [ValidateSet('PersistentStore')][string]$PolicyStore,
+   [ValidateSet('Any')][string]$Profile,
+   [ValidateSet('True')][string]$Enabled
+  )
+  if($script:blinkTestDeny){throw [System.UnauthorizedAccessException]::new('private error text')};
+  $script:blinkTestRule=$true;
+ }
+ `
+	p := client.Profile{Addresses: []string{"10.77.0.2/32"}, Routes: []string{"0.0.0.0/0"}, DNS: []string{"1.1.1.1"}, MTU: 1280}
+	script := buildNetworkScript(p)
+	if _, err := powershell(mock + script + `;if(-not $script:blinkTestRule){throw 'rule was not installed'}`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := powershell(mock + `$script:blinkTestDeny=$true;` + script)
+	var failure *exec.ExitError
+	if !errors.As(err, &failure) {
+		t.Fatalf("expected mocked firewall error: %v", err)
+	}
+	events := networkEvents(failure.Stderr)
+	if len(events) != 1 || events[0].Step != "firewall" || events[0].OK || events[0].HRESULT == 0 || events[0].Exception == "" {
+		t.Fatalf("lost failure details: %+v", events)
+	}
+	if strings.Contains(networkConfigurationError(err).Error(), "private") {
+		t.Fatal("raw error text escaped")
+	}
+}
