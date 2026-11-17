@@ -9,3 +9,6 @@
 *.aar
 *.jar
 __pycache__/
+
+# User-requested public Windows packages. Other build products stay ignored.
+!/releases/v0.2.2/*.zip

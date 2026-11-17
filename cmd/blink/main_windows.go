@@ -33,7 +33,7 @@ import (
 //go:embed ui/*
 var assets embed.FS
 
-const version = "0.2.1"
+const version = "0.2.2"
 
 type ProfileView struct {
 	Index    int    `json:"index"`
@@ -55,7 +55,7 @@ type View struct {
 	Diagnostic      json.RawMessage       `json:"diagnostic"`
 	HasSubscription bool                  `json:"hasSubscription"`
 	Revision        int64                 `json:"revision"`
-	VK              client.VKOptions      `json:"vk"`
+	TURN            client.VKOptions      `json:"turn"`
 	Routing         client.RoutingOptions `json:"routing"`
 	Captcha         *ChallengeView        `json:"captcha,omitempty"`
 }
@@ -92,9 +92,13 @@ func (a *Application) Snapshot() View {
 	if a.state.Routing != nil {
 		route = *a.state.Routing
 	}
-	v := View{ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, VK: vk, Routing: route, Captcha: a.challenge}
+	v := View{ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, TURN: vk, Routing: route, Captcha: a.challenge}
 	for i, p := range a.state.Profiles {
-		v.Profiles = append(v.Profiles, ProfileView{Index: i, Name: p.Name, Kind: p.Kind, Selected: i == a.state.Selected, Routing: len(p.Routing) > 0 && string(p.Routing) != "null"})
+		kind := p.Kind
+		if kind == "vk" {
+			kind = "turn"
+		}
+		v.Profiles = append(v.Profiles, ProfileView{Index: i, Name: p.Name, Kind: kind, Selected: i == a.state.Selected, Routing: len(p.Routing) > 0 && string(p.Routing) != "null"})
 	}
 	return v
 }

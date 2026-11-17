@@ -52,6 +52,6 @@ jobs:
         with:
           name: Blink-Windows-x64-x86
           path: |
-            dist/Blink-Windows-0.2.1-*.zip
+            dist/Blink-Windows-0.2.2-*.zip
             dist/SHA256SUMS
             work/windows-smoke-*/windows-ui.png
