@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,12 +29,15 @@ import (
 
 // Only the Blink interface is changed; the physical adapter is never reconfigured.
 func powershell(script string) ([]byte, error) {
+	return powershellContext(context.Background(), script)
+}
+func powershellContext(parent context.Context, script string) ([]byte, error) {
 	codes := utf16.Encode([]rune("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';" + script))
 	b := make([]byte, 2*len(codes))
 	for i, c := range codes {
 		binary.LittleEndian.PutUint16(b[2*i:], c)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	systemDir, err := windows.GetSystemDirectory()
 	if err != nil {
@@ -42,7 +47,11 @@ func powershell(script string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, exe, "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(b))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	// Keep PowerShell progress/CLIXML on stderr out of successful stdout.
-	return cmd.Output()
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return out, ctx.Err()
+	}
+	return out, err
 }
 func Admin() bool {
 	var sid *windows.SID
@@ -128,7 +137,18 @@ func validateNetwork(p client.Profile) error {
 	}
 	return nil
 }
-func Start(p client.Profile) (*Tunnel, error) {
+func Start(ctx context.Context, p client.Profile, report func(string)) (*Tunnel, error) {
+	return awaitStart(ctx, startGate, func() (*Tunnel, error) { return start(ctx, p, report) }, func(t *Tunnel) {
+		if t != nil {
+			_ = t.Close()
+		}
+	})
+}
+func start(ctx context.Context, p client.Profile, report func(string)) (*Tunnel, error) {
+	report("adapter")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !Admin() {
 		return nil, errors.New("Запустите Blink от имени администратора для Wintun и маршрутов")
 	}
@@ -146,6 +166,16 @@ func Start(p client.Profile) (*Tunnel, error) {
 		return nil, errors.New("Нет подходящего подписанного wintun.dll рядом с Blink.exe")
 	}
 	defer windows.FreeLibrary(handle)
+	// A killed previous process may leave NRPT pointing at a dead tunnel. Clear
+	// only Blink-owned state before resolving any endpoint or creating a new core.
+	report("recovery")
+	if _, err := powershellContext(ctx, cleanupScript); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, errors.New("Windows не очистила прежние правила Blink. Выполните восстановление сети в настройках и сохраните отчёт")
+	}
+	report("adapter")
 	index, err := defaultInterface(windows.AF_INET)
 	if err != nil {
 		return nil, fmt.Errorf("Не удалось определить сетевой адаптер: %w", err)
@@ -159,8 +189,17 @@ func Start(p client.Profile) (*Tunnel, error) {
 	}
 	d, err := tun.CreateTUN("Blink", p.MTU)
 	if err != nil {
-		return nil, errors.New("Не удалось создать Wintun; проверьте DLL, права и конфликт имени Blink")
+		var number syscall.Errno
+		if errors.As(err, &number) {
+			return nil, fmt.Errorf("Не удалось создать Wintun (Windows %d); проверьте драйвер, права и конфликт имени Blink", uint32(number))
+		}
+		return nil, errors.New("Не удалось создать Wintun; проверьте драйвер, права и конфликт имени Blink")
 	}
+	if err := ctx.Err(); err != nil {
+		_ = d.Close()
+		return nil, err
+	}
+	report("engine")
 	t := &Tunnel{Device: d, Protector: Protector{Index: index, Index6: index6}, Done: make(chan struct{}), Failed: make(chan struct{})}
 	fail := func(err error) (*Tunnel, error) { t.Close(); return nil, err }
 	if p.Kind == "vk" {
@@ -175,11 +214,14 @@ func Start(p client.Profile) (*Tunnel, error) {
 	if err != nil {
 		return fail(err)
 	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
 	go t.readPackets()
 	// VK must be ready before installing any VPN routes. CAPTCHA is available meanwhile.
 	return t, nil
 }
-func (t *Tunnel) Configure(p client.Profile) error {
+func (t *Tunnel) Configure(ctx context.Context, p client.Profile) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	select {
@@ -191,26 +233,26 @@ func (t *Tunnel) Configure(p client.Profile) error {
 	if err := validateNetwork(p); err != nil {
 		return err
 	}
-	script := `$a=Get-NetAdapter -Name 'Blink';$i=$a.ifIndex;Get-NetRoute -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;Get-NetIPAddress -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;`
+	script := `$blinkStep='adapter';$a=Get-NetAdapter -Name 'Blink';$i=$a.ifIndex;Get-NetRoute -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;Get-NetIPAddress -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;`
 	if hasIPv6(p) {
-		script += `Enable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv6 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
+		script += `$blinkStep='binding';Enable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv6 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
 	} else {
-		script += `Disable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;`
+		script += `$blinkStep='binding';Disable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;`
 	}
-	script += `Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
+	script += `$blinkStep='mtu';Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
 	for _, raw := range p.Addresses {
 		prefix, _ := netip.ParsePrefix(raw)
 		family := "IPv4"
 		if prefix.Addr().Is6() {
 			family = "IPv6"
 		}
-		script += fmt.Sprintf("New-NetIPAddress -InterfaceIndex $i -IPAddress '%s' -PrefixLength %d -AddressFamily %s | Out-Null;", prefix.Addr(), prefix.Bits(), family)
+		script += fmt.Sprintf("$blinkStep='address';New-NetIPAddress -InterfaceIndex $i -IPAddress '%s' -PrefixLength %d -AddressFamily %s | Out-Null;", prefix.Addr(), prefix.Bits(), family)
 	}
 	dns := []string{}
 	for _, d := range p.DNS {
 		dns = append(dns, "'"+d+"'")
 	}
-	script += "Set-DnsClientServerAddress -InterfaceIndex $i -ServerAddresses @(" + strings.Join(dns, ",") + ");"
+	script += "$blinkStep='dns';Set-DnsClientServerAddress -InterfaceIndex $i -ServerAddresses @(" + strings.Join(dns, ",") + ");"
 	for _, r := range p.Routes {
 		routes := []string{r}
 		if r == "0.0.0.0/0" {
@@ -224,7 +266,7 @@ func (t *Tunnel) Configure(p client.Profile) error {
 			if prefix.Addr().Is6() {
 				nextHop = "::"
 			}
-			script += "New-NetRoute -InterfaceIndex $i -DestinationPrefix '" + route + "' -NextHop '" + nextHop + "' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null;"
+			script += "$blinkStep='route';New-NetRoute -InterfaceIndex $i -DestinationPrefix '" + route + "' -NextHop '" + nextHop + "' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null;"
 		}
 	}
 
@@ -235,13 +277,17 @@ func (t *Tunnel) Configure(p client.Profile) error {
 		}
 	}
 	if full {
-		script += "Add-DnsClientNrptRule -Namespace '.' -NameServers @(" + strings.Join(dns, ",") + ") -Comment 'Blink.Windows temporary';Clear-DnsClientCache;"
+		script += "$blinkStep='nrpt';Add-DnsClientNrptRule -Namespace '.' -NameServers @(" + strings.Join(dns, ",") + ") -Comment 'Blink.Windows temporary';Clear-DnsClientCache;"
 		if !hasIPv6(p) {
-			script += `New-NetFirewallRule -Name 'Blink-IPv6' -DisplayName 'Blink IPv6 while connected' -Direction Outbound -Action Block -RemoteAddress '::/0' -PolicyStore PersistentStore | Out-Null;`
+			script += `$blinkStep='firewall';New-NetFirewallRule -Name 'Blink-IPv6' -DisplayName 'Blink IPv6 while connected' -Direction Outbound -Action Block -RemoteAddress '::/0' -PolicyStore PersistentStore | Out-Null;`
 		}
 	}
-	if _, err := powershell(script); err != nil {
-		return errors.New("Не удалось настроить адреса, DNS, маршруты или IPv6-фильтр; подключение отменено")
+	script = "try {" + script + `} catch {[Console]::Error.WriteLine(('BLINK_STEP='+$blinkStep+';BLINK_HRESULT='+$_.Exception.HResult));exit 1}`
+	if _, err := powershellContext(ctx, script); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errors.New("Windows не применила адреса, DNS, маршруты или IPv6-фильтр за 30 секунд. Подключение отменено")
+		}
+		return networkConfigurationError(err)
 	}
 	return nil
 }
@@ -336,4 +382,23 @@ func defaultInterface(family winipcfg.AddressFamily) (uint32, error) {
 		})
 	}
 	return chooseDefaultInterface(candidates), nil
+}
+
+// Never surface arbitrary PowerShell stderr: only our fixed stage marker and a
+// numeric HRESULT are allowed into a support report.
+var networkMarker = regexp.MustCompile(`BLINK_STEP=(adapter|binding|mtu|address|dns|route|nrpt|firewall);BLINK_HRESULT=(-?[0-9]+)`)
+
+func networkConfigurationError(err error) error {
+	var failure *exec.ExitError
+	if errors.As(err, &failure) {
+		match := networkMarker.FindSubmatch(failure.Stderr)
+		if len(match) == 3 {
+			number, e := strconv.ParseInt(string(match[2]), 10, 64)
+			if e == nil {
+				labels := map[string]string{"adapter": "сетевой адаптер", "binding": "привязки IPv4/IPv6", "mtu": "MTU", "address": "адрес интерфейса", "dns": "DNS", "route": "маршруты", "nrpt": "правило системного DNS", "firewall": "правило IPv6-фильтра"}
+				return fmt.Errorf("Windows не настроила %s (HRESULT 0x%08X). Подключение отменено", labels[string(match[1])], uint32(number))
+			}
+		}
+	}
+	return errors.New("Не удалось настроить адреса, DNS, маршруты или IPv6-фильтр; подключение отменено")
 }

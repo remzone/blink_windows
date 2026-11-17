@@ -11,4 +11,4 @@
 __pycache__/
 
 # User-requested public Windows packages. Other build products stay ignored.
-!/releases/v0.2.2/*.zip
+!/testing/0.3.0-preview.1/*.zip

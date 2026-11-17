@@ -20,23 +20,28 @@ import (
 const MaxDocument = 1 << 20
 
 type Profile struct {
-	Routing   json.RawMessage `json:"routing,omitempty"`
-	Name      string          `json:"name"`
-	Kind      string          `json:"kind"`
-	Raw       json.RawMessage `json:"raw"`
-	Addresses []string        `json:"addresses"`
-	DNS       []string        `json:"dns"`
-	Routes    []string        `json:"routes"`
-	MTU       int             `json:"mtu"`
+	ExternalID string          `json:"externalId,omitempty"`
+	ID         string          `json:"id,omitempty"`
+	SourceID   string          `json:"sourceId,omitempty"`
+	Routing    json.RawMessage `json:"routing,omitempty"`
+	Name       string          `json:"name"`
+	Kind       string          `json:"kind"`
+	Raw        json.RawMessage `json:"raw"`
+	Addresses  []string        `json:"addresses"`
+	DNS        []string        `json:"dns"`
+	Routes     []string        `json:"routes"`
+	MTU        int             `json:"mtu"`
 }
 type State struct {
-	ExpiresAt       int64           `json:"expiresAt,omitempty"`
-	VKOptions       *VKOptions      `json:"vkOptions,omitempty"`
-	Routing         *RoutingOptions `json:"routingOptions,omitempty"`
-	Profiles        []Profile       `json:"profiles"`
-	Selected        int             `json:"selected"`
-	SubscriptionURL string          `json:"subscriptionURL,omitempty"`
-	Revision        int64           `json:"revision"`
+	Sources         []Source          `json:"sources,omitempty"`
+	Selections      map[string]string `json:"selections,omitempty"`
+	ExpiresAt       int64             `json:"expiresAt,omitempty"`
+	VKOptions       *VKOptions        `json:"vkOptions,omitempty"`
+	Routing         *RoutingOptions   `json:"routingOptions,omitempty"`
+	Profiles        []Profile         `json:"profiles"`
+	Selected        int               `json:"selected"`
+	SubscriptionURL string            `json:"subscriptionURL,omitempty"`
+	Revision        int64             `json:"revision"`
 }
 type ImportResult struct {
 	ExpiresAt int64
@@ -164,7 +169,7 @@ func parseVokop(raw string, now time.Time, minimum int64) (ImportResult, error) 
 				return ImportResult{}, err
 			}
 		}
-		p := Profile{Routing: d.Routing, Name: v.Name, Kind: "vk", Addresses: []string{"10.77.0.2/32"}, DNS: []string{"1.1.1.1"}, Routes: []string{"0.0.0.0/0"}, MTU: 1280}
+		p := Profile{ExternalID: v.ID, Routing: d.Routing, Name: v.Name, Kind: "vk", Addresses: []string{"10.77.0.2/32"}, DNS: []string{"1.1.1.1"}, Routes: []string{"0.0.0.0/0"}, MTU: 1280}
 		if backend == "wireguard" {
 			doc, err := mobile.ImportProfile(v.WireGuard)
 			if err != nil {
@@ -215,7 +220,7 @@ func Fetch(ctx context.Context, rawURL string) (string, error) {
 		return "", errors.New("Некорректная ссылка")
 	}
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "Blink-Windows/0.1.0")
+	req.Header.Set("User-Agent", "Blink-Windows/0.3.0-preview.1")
 	res, err := c.Do(req)
 	if err != nil {
 		return "", errors.New("Не удалось загрузить подписку по HTTPS")

@@ -25,12 +25,12 @@ jobs:
         with:
           node-version: '22'
       - name: Test Windows x64 platform and importer
-        run: go test ./internal/...
+        run: go test ./cmd/blink ./internal/...
       - name: Test Windows x86 platform and importer under WOW64
         shell: pwsh
         run: |
           $env:GOARCH = '386'
-          go test ./internal/...
+          go test ./cmd/blink ./internal/...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test shared core
         run: go test ./...
@@ -52,6 +52,6 @@ jobs:
         with:
           name: Blink-Windows-x64-x86
           path: |
-            dist/Blink-Windows-0.2.2-*.zip
+            dist/Blink-Windows-0.3.0-preview.1-*.zip
             dist/SHA256SUMS
             work/windows-smoke-*/windows-ui.png

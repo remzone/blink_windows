@@ -5,6 +5,7 @@ import (
 	"github.com/remzone/blink_windows/internal/client"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -73,5 +74,17 @@ func TestPowerShellStderrCannotCorruptStdout(t *testing.T) {
 	}
 	if strings.TrimSpace(string(out)) != "42" {
 		t.Fatalf("unexpected stdout: %q", out)
+	}
+}
+
+func TestNetworkFailureExportsOnlyKnownStepAndNumericHRESULT(t *testing.T) {
+	failure := &exec.ExitError{Stderr: []byte("private-server.example/private-token BLINK_STEP=dns;BLINK_HRESULT=-2147024891 private-key")}
+	message := networkConfigurationError(failure).Error()
+	if !strings.Contains(message, "DNS") || !strings.Contains(message, "0x80070005") || strings.Contains(message, "private") {
+		t.Fatal(message)
+	}
+	failure.Stderr = []byte("BLINK_STEP=private-token;BLINK_HRESULT=5")
+	if strings.Contains(networkConfigurationError(failure).Error(), "private") {
+		t.Fatal("unknown step leaked")
 	}
 }

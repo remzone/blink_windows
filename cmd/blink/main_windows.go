@@ -33,31 +33,44 @@ import (
 //go:embed ui/*
 var assets embed.FS
 
-const version = "0.2.2"
+const version = "0.3.0-preview.1"
 
+type SourceView struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	Count       int    `json:"count"`
+	Refreshable bool   `json:"refreshable"`
+	ExpiresAt   int64  `json:"expiresAt,omitempty"`
+}
 type ProfileView struct {
-	Index    int    `json:"index"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-	Selected bool   `json:"selected"`
-	Routing  bool   `json:"routing"`
+	SourceID  string `json:"sourceId"`
+	ExpiresAt int64  `json:"expiresAt,omitempty"`
+	Index     int    `json:"index"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	Selected  bool   `json:"selected"`
+	Routing   bool   `json:"routing"`
 }
 type View struct {
-	ExpiresAt       int64                 `json:"expiresAt"`
-	Version         string                `json:"version"`
-	Arch            string                `json:"arch"`
-	Profiles        []ProfileView         `json:"profiles"`
-	Selected        int                   `json:"selected"`
-	Busy            bool                  `json:"busy"`
-	Phase           string                `json:"phase"`
-	Message         string                `json:"message"`
-	Stats           json.RawMessage       `json:"stats"`
-	Diagnostic      json.RawMessage       `json:"diagnostic"`
-	HasSubscription bool                  `json:"hasSubscription"`
-	Revision        int64                 `json:"revision"`
-	TURN            client.VKOptions      `json:"turn"`
-	Routing         client.RoutingOptions `json:"routing"`
-	Captcha         *ChallengeView        `json:"captcha,omitempty"`
+	Sources         []SourceView           `json:"sources"`
+	Selections      map[string]int         `json:"selections"`
+	Connection      client.ConnectionTrace `json:"connection"`
+	ExpiresAt       int64                  `json:"expiresAt"`
+	Version         string                 `json:"version"`
+	Arch            string                 `json:"arch"`
+	Profiles        []ProfileView          `json:"profiles"`
+	Selected        int                    `json:"selected"`
+	Busy            bool                   `json:"busy"`
+	Phase           string                 `json:"phase"`
+	Message         string                 `json:"message"`
+	Stats           json.RawMessage        `json:"stats"`
+	Diagnostic      json.RawMessage        `json:"diagnostic"`
+	HasSubscription bool                   `json:"hasSubscription"`
+	Revision        int64                  `json:"revision"`
+	TURN            client.VKOptions       `json:"turn"`
+	Routing         client.RoutingOptions  `json:"routing"`
+	Captcha         *ChallengeView         `json:"captcha,omitempty"`
 }
 type ChallengeView struct {
 	ID      string `json:"id"`
@@ -66,6 +79,9 @@ type ChallengeView struct {
 	Expires int64  `json:"expires_at"`
 }
 type Application struct {
+	connectionCancel                            context.CancelFunc
+	connection                                  client.ConnectionTrace
+	attempt                                     uint64
 	captchaSubmitted                            string
 	captchaDeadline                             time.Time
 	mu                                          sync.Mutex
@@ -92,13 +108,28 @@ func (a *Application) Snapshot() View {
 	if a.state.Routing != nil {
 		route = *a.state.Routing
 	}
-	v := View{ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, TURN: vk, Routing: route, Captcha: a.challenge}
+	trace := a.connection
+	trace.Events = append([]client.ConnectionEvent(nil), trace.Events...)
+	if trace.StartedAt > 0 && trace.Stage != "failed" && trace.Stage != "disconnected" {
+		trace.ElapsedSeconds = (time.Now().UnixMilli() - trace.StartedAt) / 1000
+	}
+	v := View{Sources: []SourceView{}, Connection: trace, Selections: map[string]int{"vpn": a.state.PreferredIndex("vpn"), "turn": a.state.PreferredIndex("turn")}, ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, TURN: vk, Routing: route, Captcha: a.challenge}
 	for i, p := range a.state.Profiles {
 		kind := p.Kind
 		if kind == "vk" {
 			kind = "turn"
 		}
-		v.Profiles = append(v.Profiles, ProfileView{Index: i, Name: p.Name, Kind: kind, Selected: i == a.state.Selected, Routing: len(p.Routing) > 0 && string(p.Routing) != "null"})
+		source, _ := a.state.Source(p.SourceID)
+		v.Profiles = append(v.Profiles, ProfileView{SourceID: p.SourceID, ExpiresAt: source.ExpiresAt, Index: i, Name: p.Name, Kind: kind, Selected: i == a.state.Selected, Routing: len(p.Routing) > 0 && string(p.Routing) != "null"})
+	}
+	for _, source := range a.state.Sources {
+		count := 0
+		for _, p := range a.state.Profiles {
+			if p.SourceID == source.ID {
+				count++
+			}
+		}
+		v.Sources = append(v.Sources, SourceView{ID: source.ID, Name: source.Name, Kind: source.Kind, Count: count, Refreshable: source.URL != "", ExpiresAt: source.ExpiresAt})
 	}
 	return v
 }
@@ -147,7 +178,7 @@ func (a *Application) Import(source string) error {
 	}
 	a.emit()
 	a.mu.Lock()
-	old := a.state
+	old := a.state.Clone()
 	ctx, cancel := context.WithCancel(a.ctx)
 	a.cancel = cancel
 	a.mu.Unlock()
@@ -158,10 +189,7 @@ func (a *Application) Import(source string) error {
 		link = raw
 		raw, err = client.Fetch(ctx, link)
 	}
-	minimum := int64(0)
-	if link != "" && link == old.SubscriptionURL {
-		minimum = old.Revision
-	}
+	minimum := old.MinimumRevision(link)
 	var result client.ImportResult
 	if err == nil {
 		result, err = client.Parse(raw, time.Now(), minimum)
@@ -176,7 +204,13 @@ func (a *Application) Import(source string) error {
 		a.finish("Импорт отменён")
 		return nil
 	}
-	a.state = client.State{ExpiresAt: result.ExpiresAt, Profiles: result.Profiles, Selected: 0, SubscriptionURL: link, Revision: result.Revision, VKOptions: old.VKOptions, Routing: old.Routing}
+	next, mergeErr := old.MergeImport(result, link, time.Now())
+	if mergeErr != nil {
+		a.mu.Unlock()
+		a.finish(mergeErr.Error())
+		return mergeErr
+	}
+	a.state = next
 	err = a.saveLocked()
 	if err != nil {
 		a.state = old
@@ -221,17 +255,73 @@ func (a *Application) Refresh() error {
 	}
 	return a.Import(link)
 }
+func (a *Application) RefreshSource(id string) error {
+	a.mu.Lock()
+	source, ok := a.state.Source(id)
+	a.mu.Unlock()
+	if !ok || source.URL == "" {
+		return errors.New("У этого источника нет ссылки обновления")
+	}
+	return a.Import(source.URL)
+}
+func (a *Application) DeleteSource(id string) error {
+	a.mu.Lock()
+	if a.busy || a.tunnel != nil {
+		a.mu.Unlock()
+		return errors.New("Отключитесь перед удалением источника")
+	}
+	old := a.state.Clone()
+	next := a.state.Clone()
+	next.Sources = nil
+	next.Profiles = nil
+	selectedID := ""
+	if old.Selected >= 0 && old.Selected < len(old.Profiles) {
+		selectedID = old.Profiles[old.Selected].ID
+	}
+	for _, source := range old.Sources {
+		if source.ID != id {
+			next.Sources = append(next.Sources, source)
+		}
+	}
+	for _, p := range old.Profiles {
+		if p.SourceID != id {
+			next.Profiles = append(next.Profiles, p)
+		}
+	}
+	next.Selected = 0
+	for i, p := range next.Profiles {
+		if p.ID == selectedID {
+			next.Selected = i
+			break
+		}
+	}
+	if len(next.Profiles) > 0 {
+		next.SelectProfile(next.Selected)
+	} else {
+		next.SubscriptionURL = ""
+		next.ExpiresAt = 0
+		next.Revision = 0
+	}
+	a.state = next
+	err := a.saveLocked()
+	if err != nil {
+		a.state = old
+	}
+	a.mu.Unlock()
+	a.emit()
+	return err
+}
 func (a *Application) Select(index int) error {
 	a.mu.Lock()
 	if a.busy || a.tunnel != nil || index < 0 || index >= len(a.state.Profiles) {
 		a.mu.Unlock()
 		return errors.New("Отключитесь, чтобы сменить профиль")
 	}
-	old := a.state.Selected
-	a.state.Selected = index
+	old := a.state.Clone()
+	a.state.SelectProfile(index)
 	err := a.saveLocked()
 	if err != nil {
-		a.state.Selected = old
+		a.state = old
 	}
 	a.mu.Unlock()
 	a.emit()
@@ -243,11 +333,8 @@ func (a *Application) Delete(index int) error {
 		a.mu.Unlock()
 		return errors.New("Отключитесь, чтобы изменить профили")
 	}
-	old := a.state
-	profiles := append([]client.Profile(nil), old.Profiles[:index]...)
-	profiles = append(profiles, old.Profiles[index+1:]...)
-	a.state.Profiles = profiles
-	a.state.Selected = 0
+	old := a.state.Clone()
+	a.state = a.state.RemoveProfile(index)
 	err := a.saveLocked()
 	if err != nil {
 		a.state = old
@@ -268,7 +355,7 @@ func (a *Application) SaveSettings(vk client.VKOptions, routing client.RoutingOp
 		a.mu.Unlock()
 		return errors.New("Отключитесь перед изменением настроек")
 	}
-	old := a.state
+	old := a.state.Clone()
 	a.state.VKOptions = &vk
 	a.state.Routing = &routing
 	err := a.saveLocked()
@@ -278,6 +365,17 @@ func (a *Application) SaveSettings(vk client.VKOptions, routing client.RoutingOp
 	a.mu.Unlock()
 	a.emit()
 	return err
+}
+func (a *Application) reportStage(attempt uint64, stage string) {
+	a.mu.Lock()
+	if a.attempt != attempt || a.cancelPending || a.closing || a.connectionCancel == nil {
+		a.mu.Unlock()
+		return
+	}
+	a.connection.SetStage(stage, time.Now())
+	a.message = a.connection.Detail
+	a.mu.Unlock()
+	a.emit()
 }
 func (a *Application) Connect() error {
 	if err := a.begin("Готовим защищённое соединение…", true); err != nil {
@@ -299,80 +397,139 @@ func (a *Application) Connect() error {
 	if a.state.Routing != nil {
 		routing = *a.state.Routing
 	}
+	a.attempt++
+	attempt := a.attempt
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.connectionCancel = cancel
+	a.connection = client.NewConnectionTrace(time.Now())
+	a.connection.SetStage("adapter", time.Now())
 	a.phase = "connecting"
 	a.diagnostic = nil
+	a.started = time.Now()
 	a.mu.Unlock()
 	a.emit()
+	_ = mobile.DrainDiagnosticEventsJSON()
 	p, err := client.ConnectionProfile(p, vk, routing)
 	var t *platform.Tunnel
+	startCtx, startCancel := context.WithTimeout(ctx, 45*time.Second)
 	if err == nil {
-		t, err = platform.Start(p)
+		t, err = platform.Start(startCtx, p, func(stage string) { a.reportStage(attempt, stage) })
 	}
+	startCancel()
 	a.mu.Lock()
-	cancelled := a.cancelPending || a.closing
+	cancelled := a.cancelPending || a.closing || ctx.Err() != nil
 	if err != nil || cancelled {
 		a.mu.Unlock()
+		cancel()
 		if t != nil {
 			_ = t.Close()
 		}
 		a.mu.Lock()
 		a.phase = "disconnected"
-		a.mu.Unlock()
+		a.connectionCancel = nil
+		message := "Подключение отменено"
 		if cancelled {
-			a.finish("Подключение отменено")
+			a.connection.SetStage("disconnected", time.Now())
+		} else {
+			message = err.Error()
+			code := "START_FAILED"
+			if errors.Is(err, context.DeadlineExceeded) {
+				message = a.connection.TimeoutMessage()
+				code = "START_TIMEOUT"
+			}
+			a.connection.Fail(code, message, time.Now())
+		}
+		a.mu.Unlock()
+		a.finish(message)
+		if cancelled {
 			return nil
 		}
-		a.finish(err.Error())
-		return err
+		return errors.New(message)
 	}
 	a.tunnel = t
 	a.captchaSubmitted = ""
 	a.captchaDeadline = time.Time{}
-	a.started = time.Now()
+	if p.Kind == "vk" {
+		a.connection.SetStage("transport", time.Now())
+	} else {
+		a.connection.SetStage("network", time.Now())
+	}
 	a.mu.Unlock()
 	a.finish("Ожидаем готовности транспорта…")
-	go a.monitor(t, p)
+	go a.monitor(ctx, t, p, attempt)
 	return nil
 }
-func (a *Application) monitor(t *platform.Tunnel, p client.Profile) {
+func (a *Application) failConnection(t *platform.Tunnel, code, message string) {
+	_ = a.disconnect(t, code, message)
+}
+func (a *Application) monitor(ctx context.Context, t *platform.Tunnel, p client.Profile, attempt uint64) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(90 * time.Second)
 	configured := false
+	recovering := false
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-t.Done:
 			return
 		case <-t.Failed:
-			_ = a.Disconnect()
+			a.failConnection(t, "PACKET_IO_FAILED", "Сетевой адаптер остановил обработку пакетов. Сохраните отчёт подключения.")
 			return
 		case <-ticker.C:
 		}
 		status := t.Engine.Status()
-		a.mu.Lock()
-		answerExpired := !a.captchaDeadline.IsZero() && time.Now().After(a.captchaDeadline) && !configured
-		a.mu.Unlock()
-		if answerExpired {
-			_ = a.Disconnect()
-			a.mu.Lock()
-			a.message = "Транспорт не подтвердил готовность за 60 секунд. Подключитесь заново."
-			a.mu.Unlock()
-			a.emit()
-			return
+		ready := status == "ready" || status == "running"
+		if configured && !ready && !recovering {
+			deadline = time.Now().Add(90 * time.Second)
+			recovering = true
+			a.reportStage(attempt, "transport")
 		}
-		if status == "stopped" || !configured && time.Now().After(deadline) {
-			_ = a.Disconnect()
-			return
+		if ready {
+			recovering = false
 		}
 		var challenge ChallengeView
 		_ = json.Unmarshal([]byte(t.Engine.CaptchaJSON()), &challenge)
+		events := mobile.DrainDiagnosticEventsJSON()
+		a.mu.Lock()
+		if a.tunnel != t || a.disconnecting || a.attempt != attempt {
+			a.mu.Unlock()
+			return
+		}
+		a.connection.Consume(events, time.Now())
+		if ready {
+			a.captchaDeadline = time.Time{}
+		}
+		pending := challenge.ID != "" && challenge.ID != a.captchaSubmitted
+		answerExpired := !a.captchaDeadline.IsZero() && time.Now().After(a.captchaDeadline) && (!configured || recovering)
+		problem := a.connection.TimeoutMessage()
+		problemCode := a.connection.SafeProblemCode()
+		a.mu.Unlock()
+		if answerExpired {
+			a.failConnection(t, "CHECK_RESPONSE_TIMEOUT", "После ручной проверки транспорт не подтвердил готовность за 60 секунд.")
+			return
+		}
+		if pending {
+			deadline = time.Now().Add(90 * time.Second)
+			if challenge.Expires > 0 && time.Now().Unix() >= challenge.Expires {
+				a.failConnection(t, "CHECK_EXPIRED", "Истекло время ручной проверки. Подключитесь заново.")
+				return
+			}
+		} else if (!configured || recovering) && time.Now().After(deadline) {
+			a.failConnection(t, problemCode, problem)
+			return
+		}
+		if status == "stopped" {
+			a.failConnection(t, "CORE_STOPPED", "VPN-ядро остановилось. Сохраните отчёт подключения.")
+			return
+		}
 		if !configured && (status == "ready" || status == "running") {
-			if err := t.Configure(p); err != nil {
-				_ = a.Disconnect()
-				a.mu.Lock()
-				a.message = err.Error()
-				a.mu.Unlock()
-				a.emit()
+			a.reportStage(attempt, "network")
+			if err := t.Configure(ctx, p); err != nil {
+				if ctx.Err() == nil {
+					a.failConnection(t, "NETWORK_CONFIG_FAILED", err.Error())
+				}
 				return
 			}
 			configured = true
@@ -384,25 +541,46 @@ func (a *Application) monitor(t *platform.Tunnel, p client.Profile) {
 		}
 		a.stats = json.RawMessage(t.Engine.StatsJSON())
 		a.challenge = nil
-		if challenge.ID != "" && challenge.ID != a.captchaSubmitted {
+		if pending {
 			a.challenge = &challenge
 			a.phase = "captcha"
-			a.message = "Один небольшой шаг. Пройдите проверку — Blink продолжит подключение."
-		} else if configured {
+			a.connection.SetStage("captcha", time.Now())
+		} else if configured && ready {
 			a.phase = "connected"
-			a.message = "Соединение активно. Ваш профиль готов к работе."
+			a.connection.SetStage("connected", time.Now())
 		} else {
 			a.phase = "connecting"
+			if a.connection.Stage == "captcha" {
+				a.connection.SetStage("transport", time.Now())
+			}
 		}
+		a.message = a.connection.Detail
 		a.mu.Unlock()
 		a.emit()
 	}
 }
-func (a *Application) Disconnect() error {
+func (a *Application) CopyConnectionReport() error {
 	a.mu.Lock()
+	report := a.connection.Report(version, goruntime.GOARCH)
+	ctx := a.ctx
+	a.mu.Unlock()
+	return runtime.ClipboardSetText(ctx, report)
+}
+
+func (a *Application) Disconnect() error { return a.disconnect(nil, "", "") }
+func (a *Application) disconnect(expected *platform.Tunnel, code, message string) error {
+	a.mu.Lock()
+	if expected != nil && a.tunnel != expected {
+		a.mu.Unlock()
+		return nil
+	}
 	if a.disconnecting {
 		a.mu.Unlock()
 		return nil
+	}
+	if a.connectionCancel != nil {
+		a.connectionCancel()
+		a.connectionCancel = nil
 	}
 	t := a.tunnel
 	if t == nil {
@@ -416,6 +594,7 @@ func (a *Application) Disconnect() error {
 	a.disconnecting = true
 	a.busy = true
 	a.phase = "disconnecting"
+	a.connection.SetStage("stopping", time.Now())
 	a.challenge = nil
 	a.mu.Unlock()
 	a.emit()
@@ -426,15 +605,27 @@ func (a *Application) Disconnect() error {
 	a.challenge = nil
 	a.phase = "disconnected"
 	a.disconnecting = false
+	a.connection.ElapsedSeconds = (time.Now().UnixMilli() - a.connection.StartedAt) / 1000
+	if code != "" {
+		if err != nil {
+			message += " Не все правила сняты; используйте восстановление сети."
+		}
+		a.connection.Fail(code, message, time.Now())
+	} else {
+		a.connection.SetStage("disconnected", time.Now())
+		message = "Отключено. Вы готовы к следующему подключению."
+	}
 	if err != nil {
 		a.closing = false
+		if code == "" {
+			message = "Не все сетевые правила очищены. Используйте восстановление сети"
+		}
 	}
 	a.mu.Unlock()
+	a.finish(message)
 	if err != nil {
-		a.finish("Проверьте восстановление сети в настройках")
 		return errors.New("Не все сетевые правила очищены. Используйте восстановление сети")
 	}
-	a.finish("Отключено. Вы готовы к следующему подключению.")
 	return nil
 }
 func (a *Application) Probe(kind string) error {
@@ -564,6 +755,7 @@ func main() {
 	} else if !errors.Is(e, os.ErrNotExist) {
 		app.message = "Не удалось расшифровать профили текущего пользователя"
 	}
+	app.state.Normalize()
 	// Browser state is transient and never shared with the system browser.
 	entries, _ := os.ReadDir(dir)
 	for _, entry := range entries {
