@@ -16,6 +16,9 @@ Blink Windows integration is GPL-3.0-only; see LICENSE. Dependencies retain thei
 | Geodata | native/resources/LICENSE and native/resources/UPSTREAM.md |
 | Go Windows APIs | golang.org/x/sys/windows; BSD-3-Clause |
 | YAML parser | gopkg.in/yaml.v3; MIT / Apache-2.0 |
+| Desktop host | github.com/wailsapp/wails/v2 v2.17.1; MIT |
+| WebView2 bindings | github.com/wailsapp/go-webview2 v1.0.22; MIT and embedded loader notices |
+| VK ID CAPTCHA Web SDK | @vkid/captcha 2.0.0, V Kontakte LLC; MIT; cmd/blink/ui/vendor/VKID-CAPTCHA-LICENSE.txt and UPSTREAM.json |
 | Manifest resource generator (build only) | github.com/akavel/rsrc v0.10.2; MIT |
 
 Other transitive dependencies include Pion networking libraries, KCP/smux, QUIC/TLS libraries and their own license files in their source modules. These notices do not relicense those components. Consult the pinned source modules when redistributing binaries. Sources for this client are available at https://github.com/remzone/blink_windows and upstream module sources remain identifiable through go.mod/go.sum.

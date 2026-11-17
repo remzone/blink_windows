@@ -20,6 +20,7 @@ import (
 const MaxDocument = 1 << 20
 
 type Profile struct {
+	Routing   json.RawMessage `json:"routing,omitempty"`
 	Name      string          `json:"name"`
 	Kind      string          `json:"kind"`
 	Raw       json.RawMessage `json:"raw"`
@@ -29,16 +30,20 @@ type Profile struct {
 	MTU       int             `json:"mtu"`
 }
 type State struct {
-	Profiles        []Profile `json:"profiles"`
-	Selected        int       `json:"selected"`
-	SubscriptionURL string    `json:"subscriptionURL,omitempty"`
-	Revision        int64     `json:"revision"`
+	ExpiresAt       int64           `json:"expiresAt,omitempty"`
+	VKOptions       *VKOptions      `json:"vkOptions,omitempty"`
+	Routing         *RoutingOptions `json:"routingOptions,omitempty"`
+	Profiles        []Profile       `json:"profiles"`
+	Selected        int             `json:"selected"`
+	SubscriptionURL string          `json:"subscriptionURL,omitempty"`
+	Revision        int64           `json:"revision"`
 }
 type ImportResult struct {
-	Profiles []Profile
-	Rejected int
-	Notice   string
-	Revision int64
+	ExpiresAt int64
+	Profiles  []Profile
+	Rejected  int
+	Notice    string
+	Revision  int64
 }
 
 func Parse(raw string, now time.Time, minimum int64) (ImportResult, error) {
@@ -107,19 +112,28 @@ func parseVokop(raw string, now time.Time, minimum int64) (ImportResult, error) 
 	if len(raw) > MaxDocument || !uniqueJSON(raw) || json.Unmarshal([]byte(raw), &d) != nil {
 		return ImportResult{}, errors.New("Некорректный документ Vokop")
 	}
-	if d.Schema != "vokop.subscription.v1" && d.Schema != "vokop.subscription.v2" {
-		return ImportResult{}, errors.New("Поддерживаются Vokop v1/v2; v3 с выборочной маршрутизацией пока не поддерживается")
+	if d.Schema != "vokop.subscription.v1" && d.Schema != "vokop.subscription.v2" && d.Schema != "vokop.subscription.v3" {
+		return ImportResult{}, errors.New("Неизвестная версия подписки Vokop")
 	}
-	if d.Revision < 1 || d.Revision < minimum || d.Issued < 0 || d.Issued > now.Unix()+300 || d.Expires <= now.Unix() || d.Expires <= d.Issued || d.Expires > 253402300799 {
+	if d.Revision < 1 || d.Revision > 9007199254740991 || d.Revision < minimum || d.Issued < 0 || d.Issued > now.Unix()+300 || d.Expires <= now.Unix() || d.Expires <= d.Issued || d.Expires > 253402300799 {
 		return ImportResult{}, errors.New("Подписка истекла, датирована будущим или имеет устаревшую версию")
 	}
 	if len(d.Profiles) < 1 || len(d.Profiles) > 16 || len(d.VPNProfiles) > 128 {
 		return ImportResult{}, errors.New("Превышен лимит профилей")
 	}
+	var routing *mobile.RoutingPolicy
 	if len(d.Routing) > 0 && string(d.Routing) != "null" {
-		return ImportResult{}, errors.New("Правила панели не поддерживаются: импорт остановлен, чтобы не менять маршрутизацию молча")
+		routing = &mobile.RoutingPolicy{}
+		dec := json.NewDecoder(strings.NewReader(string(d.Routing)))
+		dec.DisallowUnknownFields()
+		if dec.Decode(routing) != nil || routing.Validate() != nil {
+			return ImportResult{}, errors.New("Некорректные правила маршрутизации панели")
+		}
 	}
-	result := ImportResult{Revision: d.Revision}
+	if d.Schema == "vokop.subscription.v3" && (routing == nil || routing.Mode != "selected") {
+		return ImportResult{}, errors.New("Vokop v3 требует выборочных правил маршрутизации")
+	}
+	result := ImportResult{Revision: d.Revision, ExpiresAt: d.Expires}
 	ids := map[string]bool{}
 	for _, v := range d.Profiles {
 		if !idPattern.MatchString(v.ID) || ids[v.ID] || !uuidPattern.MatchString(v.Vless.UUID) || !hostPattern.MatchString(v.Turn.Host) || !strings.Contains(v.Turn.Host, ".") || !callPattern.MatchString(v.Turn.Call) || v.Turn.Port < 1 || v.Turn.Port > 65535 || v.Turn.Streams < 1 || v.Turn.Streams > 16 || len([]rune(v.Name)) < 1 || len([]rune(v.Name)) > 100 || strings.ContainsAny(v.Name, "\r\n\x00") {
@@ -136,11 +150,21 @@ func parseVokop(raw string, now time.Time, minimum int64) (ImportResult, error) 
 		if backend != "vless" && backend != "wireguard" || backend == "vless" && (protocol != "kcp" || v.WireGuard != "") || backend == "wireguard" && (d.Schema == "vokop.subscription.v1" || v.WireGuard == "" || (protocol != "dtls" && protocol != "srtp" && protocol != "wrap")) {
 			return ImportResult{}, errors.New("Несовместимые backend и транспорт Vokop")
 		}
-		if len(v.Turn.Options) > 0 && string(v.Turn.Options) != "null" && string(v.Turn.Options) != "{}" {
-			return ImportResult{}, errors.New("Расширенные turn.options панели пока не поддерживаются")
+		vk := mobile.VKProfile{Routing: routing, Backend: backend, Protocol: protocol, WireGuard: v.WireGuard, WrapKey: v.Turn.WrapKey, TURNTransport: "auto", ManualCaptcha: true, Mode: "vk", UUID: v.Vless.UUID, PeerHost: v.Turn.Host, PeerPort: v.Turn.Port, VKCallURL: v.Turn.Call, Streams: v.Turn.Streams, DNSServer: "1.1.1.1", ExpiresAt: d.Expires}
+		if len(v.Turn.Options) > 0 && string(v.Turn.Options) != "null" {
+			options := DefaultVKOptions()
+			dec := json.NewDecoder(strings.NewReader(string(v.Turn.Options)))
+			dec.DisallowUnknownFields()
+			if dec.Decode(&options) != nil {
+				return ImportResult{}, errors.New("Неверные параметры TURN панели")
+			}
+			// As on Android, allocation count is inherited from turn.streams.
+			options.Connections = 0
+			if err := options.Apply(&vk); err != nil {
+				return ImportResult{}, err
+			}
 		}
-		vk := mobile.VKProfile{Backend: backend, Protocol: protocol, WireGuard: v.WireGuard, WrapKey: v.Turn.WrapKey, TURNTransport: "auto", ManualCaptcha: true, Mode: "vk", UUID: v.Vless.UUID, PeerHost: v.Turn.Host, PeerPort: v.Turn.Port, VKCallURL: v.Turn.Call, Streams: v.Turn.Streams, DNSServer: "1.1.1.1", ExpiresAt: d.Expires}
-		p := Profile{Name: v.Name, Kind: "vk", Addresses: []string{"10.77.0.2/32"}, DNS: []string{"1.1.1.1"}, Routes: []string{"0.0.0.0/0"}, MTU: 1280}
+		p := Profile{Routing: d.Routing, Name: v.Name, Kind: "vk", Addresses: []string{"10.77.0.2/32"}, DNS: []string{"1.1.1.1"}, Routes: []string{"0.0.0.0/0"}, MTU: 1280}
 		if backend == "wireguard" {
 			doc, err := mobile.ImportProfile(v.WireGuard)
 			if err != nil {
@@ -160,6 +184,12 @@ func parseVokop(raw string, now time.Time, minimum int64) (ImportResult, error) 
 		extra, err := Parse(source, now, 0)
 		if err != nil {
 			return ImportResult{}, err
+		}
+		for i := range extra.Profiles {
+			extra.Profiles[i].Routing = d.Routing
+		}
+		if len(result.Profiles)+len(extra.Profiles) > 1024 {
+			return ImportResult{}, errors.New("Слишком много профилей в подписке")
 		}
 		result.Profiles = append(result.Profiles, extra.Profiles...)
 		result.Rejected += extra.Rejected

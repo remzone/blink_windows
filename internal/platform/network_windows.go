@@ -49,14 +49,21 @@ func Admin() bool {
 	return ok
 }
 
-type Protector struct{ Index uint32 }
+type Protector struct {
+	Index  uint32
+	Index6 uint32
+}
 
 func (p Protector) Protect(fd int64) bool {
 	// IP_UNICAST_IF takes network byte order; IPV6_UNICAST_IF takes host order.
 	index := p.Index
 	swapped := ((index & 255) << 24) | ((index & 65280) << 8) | ((index >> 8) & 65280) | (index >> 24)
 	e4 := windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, 31, int(swapped))
-	e6 := windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, 31, int(index))
+	index6 := p.Index6
+	if index6 == 0 {
+		index6 = index
+	}
+	e6 := windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, 31, int(index6))
 	return e4 == nil || e6 == nil
 }
 
@@ -75,20 +82,46 @@ func (t *Tunnel) WritePacket(b []byte) bool {
 	return err == nil
 }
 
+func hasIPv6(p client.Profile) bool {
+	for _, s := range p.Addresses {
+		a, e := netip.ParsePrefix(s)
+		if e == nil && a.Addr().Is6() {
+			return true
+		}
+	}
+	return false
+}
 func validateNetwork(p client.Profile) error {
 	if p.MTU < 576 || p.MTU > 9000 || len(p.Addresses) == 0 || len(p.Routes) == 0 || len(p.DNS) == 0 {
 		return errors.New("Профиль должен задавать адреса, маршруты и DNS")
 	}
+	v6 := hasIPv6(p)
+	if v6 {
+		wg := p.Kind == "wireguard" || p.Kind == "amneziawg"
+		if p.Kind == "vk" {
+			var v mobile.VKProfile
+			_ = json.Unmarshal(p.Raw, &v)
+			wg = v.Backend == "wireguard"
+		}
+		if !wg || p.MTU < 1280 {
+			return errors.New("IPv6 требует WireGuard/AmneziaWG и MTU не меньше 1280")
+		}
+		var route mobile.RoutingPolicy
+		_ = json.Unmarshal(p.Routing, &route)
+		if route.Mode == "selected" {
+			return errors.New("Выборочная маршрутизация общего ядра использует IPv4; для dual-stack WG выберите полный профиль")
+		}
+	}
 	for _, s := range append(append([]string{}, p.Addresses...), p.Routes...) {
 		a, e := netip.ParsePrefix(s)
-		if e != nil || !a.Addr().Is4() {
-			return errors.New("Первая версия Windows поддерживает только IPv4-конфигурации")
+		if e != nil || a.Addr().Is6() && !v6 {
+			return errors.New("Некорректный маршрут или отсутствует IPv6-адрес интерфейса")
 		}
 	}
 	for _, s := range p.DNS {
 		a, e := netip.ParseAddr(s)
-		if e != nil || !a.Is4() {
-			return errors.New("Требуется IPv4 DNS")
+		if e != nil || a.Is6() && !v6 {
+			return errors.New("DNS должен быть IP-адресом поддерживаемого семейства")
 		}
 	}
 	return nil
@@ -119,16 +152,27 @@ func Start(p client.Profile) (*Tunnel, error) {
 	if _, err = fmt.Sscan(strings.TrimSpace(string(out)), &index); err != nil || index == 0 {
 		return nil, errors.New("Не найден индекс физического интерфейса")
 	}
+	index6 := index
+	if out6, e := powershell(`$r=Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' | Where-Object {$_.InterfaceAlias -ne 'Blink'} | Sort-Object RouteMetric | Select-Object -First 1;if($r){$r.InterfaceIndex}`); e == nil {
+		var n uint32
+		if _, e = fmt.Sscan(strings.TrimSpace(string(out6)), &n); e == nil && n > 0 {
+			index6 = n
+		}
+	}
 	d, err := tun.CreateTUN("Blink", p.MTU)
 	if err != nil {
 		return nil, errors.New("Не удалось создать Wintun; проверьте DLL, права и конфликт имени Blink")
 	}
-	t := &Tunnel{Device: d, Protector: Protector{Index: index}, Done: make(chan struct{}), Failed: make(chan struct{})}
+	t := &Tunnel{Device: d, Protector: Protector{Index: index, Index6: index6}, Done: make(chan struct{}), Failed: make(chan struct{})}
 	fail := func(err error) (*Tunnel, error) { t.Close(); return nil, err }
 	if p.Kind == "vk" {
 		t.Engine, err = mobile.StartVK(string(p.Raw), t, t.Protector)
 	} else {
-		t.Engine, err = mobile.StartProfile(string(p.Raw), t, t.Protector)
+		if len(p.Routing) > 0 {
+			t.Engine, err = mobile.StartProfileRouted(string(p.Raw), string(p.Routing), t, t.Protector)
+		} else {
+			t.Engine, err = mobile.StartProfile(string(p.Raw), t, t.Protector)
+		}
 	}
 	if err != nil {
 		return fail(err)
@@ -149,10 +193,20 @@ func (t *Tunnel) Configure(p client.Profile) error {
 	if err := validateNetwork(p); err != nil {
 		return err
 	}
-	script := `$a=Get-NetAdapter -Name 'Blink';$i=$a.ifIndex;Get-NetRoute -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;Get-NetIPAddress -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
+	script := `$a=Get-NetAdapter -Name 'Blink';$i=$a.ifIndex;Get-NetRoute -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;Get-NetIPAddress -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;`
+	if hasIPv6(p) {
+		script += `Enable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv6 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
+	} else {
+		script += `Disable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;`
+	}
+	script += `Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -NlMtuBytes ` + fmt.Sprint(p.MTU) + ` -InterfaceMetric 5;`
 	for _, raw := range p.Addresses {
 		prefix, _ := netip.ParsePrefix(raw)
-		script += fmt.Sprintf("New-NetIPAddress -InterfaceIndex $i -IPAddress '%s' -PrefixLength %d -AddressFamily IPv4 | Out-Null;", prefix.Addr(), prefix.Bits())
+		family := "IPv4"
+		if prefix.Addr().Is6() {
+			family = "IPv6"
+		}
+		script += fmt.Sprintf("New-NetIPAddress -InterfaceIndex $i -IPAddress '%s' -PrefixLength %d -AddressFamily %s | Out-Null;", prefix.Addr(), prefix.Bits(), family)
 	}
 	dns := []string{}
 	for _, d := range p.DNS {
@@ -163,22 +217,30 @@ func (t *Tunnel) Configure(p client.Profile) error {
 		routes := []string{r}
 		if r == "0.0.0.0/0" {
 			routes = []string{"0.0.0.0/1", "128.0.0.0/1"}
+		} else if r == "::/0" {
+			routes = []string{"::/1", "8000::/1"}
 		}
 		for _, route := range routes {
-			script += "New-NetRoute -InterfaceIndex $i -DestinationPrefix '" + route + "' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null;"
+			nextHop := "0.0.0.0"
+			prefix, _ := netip.ParsePrefix(route)
+			if prefix.Addr().Is6() {
+				nextHop = "::"
+			}
+			script += "New-NetRoute -InterfaceIndex $i -DestinationPrefix '" + route + "' -NextHop '" + nextHop + "' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null;"
 		}
 	}
-	// IPv6 is disabled only on Blink. Full tunnel IPv6 is blocked by a dedicated firewall rule.
-	script += `Disable-NetAdapterBinding -Name 'Blink' -ComponentID ms_tcpip6 | Out-Null;`
+
 	full := false
 	for _, r := range p.Routes {
-		if r == "0.0.0.0/0" {
+		if r == "0.0.0.0/0" || r == "::/0" {
 			full = true
 		}
 	}
 	if full {
 		script += "Add-DnsClientNrptRule -Namespace '.' -NameServers @(" + strings.Join(dns, ",") + ") -Comment 'Blink.Windows temporary';Clear-DnsClientCache;"
-		script += `New-NetFirewallRule -Name 'Blink-IPv6' -DisplayName 'Blink IPv6 while connected' -Direction Outbound -Action Block -RemoteAddress '::/0' -PolicyStore PersistentStore | Out-Null;`
+		if !hasIPv6(p) {
+			script += `New-NetFirewallRule -Name 'Blink-IPv6' -DisplayName 'Blink IPv6 while connected' -Direction Outbound -Action Block -RemoteAddress '::/0' -PolicyStore PersistentStore | Out-Null;`
+		}
 	}
 	if _, err := powershell(script); err != nil {
 		return errors.New("Не удалось настроить адреса, DNS, маршруты или IPv6-фильтр; подключение отменено")

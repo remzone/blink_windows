@@ -1,11 +1,15 @@
 name: Validate Windows client
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,13 +21,37 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: go test ./internal/...
-      - run: go test ./...
-        working-directory: native
-      - run: ./tools/build.ps1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: Blink-Windows-x64
+          node-version: '22'
+      - name: Test Windows x64 platform and importer
+        run: go test ./internal/...
+      - name: Test Windows x86 platform and importer under WOW64
+        shell: pwsh
+        run: |
+          $env:GOARCH = '386'
+          go test ./internal/...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test shared core
+        run: go test ./...
+        working-directory: native
+      - name: Build and package x64 and x86
+        run: ./tools/build.ps1
+      - name: Install browser automation library without downloading browsers
+        run: npm install --prefix work/ui-test --ignore-scripts --no-audit --no-fund playwright@1.58.2
+      - name: Smoke test real x64 and x86 desktop applications
+        shell: pwsh
+        run: |
+          $env:NODE_PATH = "$PWD/work/ui-test/node_modules"
+          node tools/test-windows.cjs amd64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node tools/test-windows.cjs 386
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Blink-Windows-x64-x86
           path: |
-            dist/Blink-Windows-*-x64.zip
+            dist/Blink-Windows-0.2.0-*.zip
             dist/SHA256SUMS
+            work/windows-smoke-*/windows-ui.png

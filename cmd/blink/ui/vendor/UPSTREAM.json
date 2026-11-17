@@ -1,0 +1,9 @@
+{
+  "package": "@vkid/captcha",
+  "version": "2.0.0",
+  "author": "VK ID <devsupport@corp.vk.com>",
+  "source": "https://registry.npmjs.org/@vkid/captcha/-/captcha-2.0.0.tgz",
+  "sha256": "ca80b70bf136ef5b88dfd7be571f6c80dd8612753a8ae9b7bc8a8b035f0adc4c",
+  "license": "MIT",
+  "modified": false
+}

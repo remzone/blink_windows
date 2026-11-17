@@ -1,0 +1,42 @@
+// Run with NODE_PATH pointing to an installed Playwright package; no browser downloads.
+const {chromium}=require('playwright');
+const http=require('http'),fs=require('fs'),path=require('path'),assert=require('assert');
+const root=path.resolve(__dirname,'../cmd/blink/ui'),out=path.resolve(__dirname,'../work/ui');
+fs.mkdirSync(out,{recursive:true});
+const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'text/css'};
+const server=http.createServer((req,res)=>{const p=path.resolve(root,'.'+new URL(req.url,'http://localhost').pathname);const f=p===root?path.join(root,'index.html'):p;if(!f.startsWith(root+path.sep)){res.writeHead(403).end();return}fs.readFile(f,(e,b)=>{if(e){res.writeHead(404).end();return}res.setHeader('Content-Type',mime[path.extname(f)]||'text/plain');res.end(b)})});
+(async()=>{
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ const browser=await chromium.launch({executablePath:process.env.BLINK_CHROMIUM||chromium.executablePath(),headless:true,args:['--no-sandbox']});
+ try{
+ const page=await browser.newPage({viewport:{width:1160,height:820},reducedMotion:'reduce'});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.addInitScript(()=>{
+  window.calls=[];window.stateFixture={version:'0.2.0',arch:'386',profiles:[{index:0,name:'🇳🇱 Нидерланды · Amsterdam',kind:'xray',selected:true,routing:false},{index:1,name:'🇩🇪 Германия · Frankfurt',kind:'wireguard',selected:false,routing:true},{index:2,name:'🇫🇮 Финляндия · Helsinki',kind:'vk',selected:false,routing:true}],selected:0,busy:false,phase:'disconnected',message:'Всё начинается с одного подключения.',hasSubscription:true,revision:3,vk:{serverDefaults:true,transport:'auto',preset:'compatibility',dns:'1.1.1.1',relay:'',connections:1,mtu:1200,pace:0,window:64,interval:20,congestion:true},routing:{mode:'inherit',include:'',exclude:''}};
+  let listener=()=>{};window.runtime={EventsOn:(name,fn)=>{listener=fn}};window.updateFixture=patch=>{Object.assign(window.stateFixture,patch);listener(structuredClone(window.stateFixture))};
+  window.go={main:{Application:{Snapshot:async()=>structuredClone(window.stateFixture),Connect:async()=>{window.calls.push('Connect');window.updateFixture({phase:'connected',stats:{rx:106954752,tx:12373196}})},Disconnect:async()=>{window.calls.push('Disconnect');window.updateFixture({phase:'disconnected',captcha:null})},Import:async source=>{window.calls.push(['Import',source]);if(source==='invalid')throw 'Неподдерживаемый профиль'},ImportFile:async()=>{window.calls.push('ImportFile')},Refresh:async()=>{},Select:async i=>{window.calls.push(['Select',i]);window.stateFixture.profiles.forEach(p=>p.selected=p.index===i);window.updateFixture({selected:i})},Delete:async()=>{},Probe:async kind=>{window.calls.push(['Probe',kind]);window.updateFixture({diagnostic:{kind,ip:'203.0.113.10',dnsMs:12,tcpMs:23,tlsMs:45,responseMs:68,totalMs:148,checkedAt:1794934800}})},SaveSettings:async(vk,routing)=>{window.calls.push(['SaveSettings',vk,routing]);window.updateFixture({vk,routing})},Recover:async()=>{window.calls.push('Recover')},SubmitCaptcha:async(...args)=>{window.calls.push(['SubmitCaptcha',...args])}}}};
+ });
+ await page.goto(`http://127.0.0.1:${server.address().port}/`);await page.locator('#selected-name').filter({hasText:'Amsterdam'}).waitFor();
+ assert((await page.locator('#architecture').innerText()).includes('32-bit'));
+ await page.screenshot({path:path.join(out,'home-disconnected.png'),fullPage:true});
+ await page.locator('#connect-button').click();await page.locator('#top-status').filter({hasText:'Соединение активно'}).waitFor();assert((await page.locator('#rx').innerText()).includes('102'));await page.screenshot({path:path.join(out,'home-connected.png'),fullPage:true});
+ await page.locator('[data-page=diagnostics]').click();await page.locator('[data-probe=ip]').click();await page.locator('#diagnostic-title').filter({hasText:'203.0.113.10'}).waitFor();await page.screenshot({path:path.join(out,'diagnostics.png'),fullPage:true});
+ await page.locator('[data-page=home]').click();await page.locator('#connect-button').click();await page.locator('[data-page=profiles]').click();await page.locator('#profile-search').fill('Германия');assert.equal(await page.locator('.profile-row').count(),1);await page.locator('.profile-choice').click();assert((await page.evaluate(()=>window.calls)).some(c=>Array.isArray(c)&&c[0]==='Select'&&c[1]===1));await page.locator('#profile-search').fill('');await page.screenshot({path:path.join(out,'profiles.png'),fullPage:true});
+ await page.locator('#add-profile').click();await page.locator('#import-input').fill('invalid');await page.locator('#import-form button[type=submit]').click();await page.locator('#toast').filter({hasText:'Неподдерживаемый профиль'}).waitFor();assert.equal(await page.locator('#import-input').inputValue(),'');
+ await page.locator('[data-page=settings]').click();await page.locator('#server-defaults').uncheck();await page.locator('#vk-transport').selectOption('tcp');await page.locator('#settings-form button[type=submit]').click();assert.equal(await page.evaluate(()=>window.stateFixture.vk.transport),'tcp');await page.screenshot({path:path.join(out,'settings.png'),fullPage:true});
+ await page.evaluate(()=>window.updateFixture({profiles:[{index:0,name:'<img src=x onerror="window.injected=true">',kind:'xray',selected:true}]}));assert.equal(await page.evaluate(()=>window.injected),undefined);assert.equal(await page.locator('#selected-name img').count(),0);
+ await page.setViewportSize({width:800,height:720});await page.locator('[data-page=home]').click();assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'horizontal overflow at 800px');await page.screenshot({path:path.join(out,'compact.png'),fullPage:true});
+ await page.emulateMedia({reducedMotion:'reduce'});assert.equal(await page.locator('.ring-progress').evaluate(e=>getComputedStyle(e).animationName),'none');
+ // External CAPTCHA resources are mocked; no real VK network or credentials.
+ await page.route('https://**.vk.com/**',route=>route.fulfill({contentType:'text/html',body:'<!doctype html><title>Mock challenge</title>'}));
+ await page.evaluate(()=>window.updateFixture({phase:'captcha',captcha:{id:'test-challenge',url:'https://id.vk.com/captcha?session=fixture',expires_at:Math.floor(Date.now()/1000)+120}}));await page.locator('#captcha-container iframe').waitFor();
+ await page.evaluate(()=>window.dispatchEvent(new MessageEvent('message',{origin:'https://id.vk.com',source:window,data:{type:'vk-sak-sdk',handler:'VKCaptchaGetResult',params:{token:'forged'}}})));await page.waitForTimeout(150);
+ assert(!(await page.evaluate(()=>window.calls)).some(c=>Array.isArray(c)&&c[0]==='SubmitCaptcha'),'forged CAPTCHA accepted');
+ const frame=page.frames().find(f=>f.url().startsWith('https://id.vk.com/'));assert(frame,'mock challenge frame missing');
+ await frame.evaluate(()=>parent.postMessage({type:'vk-sak-sdk',handler:'VKCaptchaGetResult',params:{token:'fixture-token'}},'*'));
+ await page.waitForFunction(()=>window.calls.some(c=>Array.isArray(c)&&c[0]==='SubmitCaptcha'&&c[3]==='fixture-token'));
+ assert.equal((await page.evaluate(()=>window.calls)).filter(c=>Array.isArray(c)&&c[0]==='SubmitCaptcha').length,1);
+ await page.locator('#cancel-captcha').click();assert.equal(await page.locator('#captcha-dialog').evaluate(e=>e.open),false);
+ assert.deepEqual(errors,[]);console.log('UI passed: navigation, connect/disconnect, diagnostics, profile search/select, import error, settings, XSS, compact layout, reduced motion, CAPTCHA origin/source guard and cancellation.');
+ await page.close();
+ }finally{await browser.close();server.close()}
+})().catch(e=>{console.error(e);server.close();process.exitCode=1});

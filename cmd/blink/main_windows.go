@@ -5,457 +5,535 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
+	goruntime "runtime"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/remzone/blink_windows/internal/client"
 	"github.com/remzone/blink_windows/internal/platform"
 	"github.com/remzone/blink_windows/native/mobile"
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wwindows "github.com/wailsapp/wails/v2/pkg/options/windows"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"golang.org/x/sys/windows"
 )
 
-var user = windows.NewLazySystemDLL("user32.dll")
-var kernel = windows.NewLazySystemDLL("kernel32.dll")
-var gdi = windows.NewLazySystemDLL("gdi32.dll")
-var createWindow = user.NewProc("CreateWindowExW")
-var send = user.NewProc("SendMessageW")
-var setText = user.NewProc("SetWindowTextW")
-var getText = user.NewProc("GetWindowTextW")
-var getTextLen = user.NewProc("GetWindowTextLengthW")
-var post = user.NewProc("PostMessageW")
+//go:embed ui/*
+var assets embed.FS
 
-const wmCommand = 0x111
-const wmClose = 0x10
-const wmUpdate = 0x8001
-const wmDestroy = 2
-const idImport = 101
-const idConnect = 102
-const idRefresh = 103
-const idDelete = 104
-const idProbe = 105
-const idRecover = 106
-const idCaptcha = 107
-const idOpenCaptcha = 108
-const idFile = 109
+const version = "0.2.0"
 
-type point struct{ X, Y int32 }
-type message struct {
-	Hwnd    uintptr
-	Msg     uint32
-	Wparam  uintptr
-	Lparam  uintptr
-	Time    uint32
-	Pt      point
-	Private uint32
+type ProfileView struct {
+	Index    int    `json:"index"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	Selected bool   `json:"selected"`
+	Routing  bool   `json:"routing"`
 }
-type windowClass struct {
-	Size, Style                        uint32
-	Proc                               uintptr
-	ClsExtra, WndExtra                 int32
-	Instance, Icon, Cursor, Background uintptr
-	Menu, Name                         *uint16
-	SmallIcon                          uintptr
+type View struct {
+	ExpiresAt       int64                 `json:"expiresAt"`
+	Version         string                `json:"version"`
+	Arch            string                `json:"arch"`
+	Profiles        []ProfileView         `json:"profiles"`
+	Selected        int                   `json:"selected"`
+	Busy            bool                  `json:"busy"`
+	Phase           string                `json:"phase"`
+	Message         string                `json:"message"`
+	Stats           json.RawMessage       `json:"stats"`
+	Diagnostic      json.RawMessage       `json:"diagnostic"`
+	HasSubscription bool                  `json:"hasSubscription"`
+	Revision        int64                 `json:"revision"`
+	VK              client.VKOptions      `json:"vk"`
+	Routing         client.RoutingOptions `json:"routing"`
+	Captcha         *ChallengeView        `json:"captcha,omitempty"`
 }
-
-type app struct {
-	exiting                                             bool
-	disconnecting                                       bool
-	hwnd, input, list, status, detail, captcha, connect uintptr
-	state                                               client.State
-	tunnel                                              *platform.Tunnel
-	busy                                                bool
-	connected                                           bool
-	updates                                             chan func()
-	pendingChallenge                                    string
-	font                                                uintptr
+type ChallengeView struct {
+	ID      string `json:"id"`
+	URL     string `json:"url,omitempty"`
+	Image   string `json:"image,omitempty"`
+	Expires int64  `json:"expires_at"`
+}
+type Application struct {
+	captchaSubmitted                            string
+	captchaDeadline                             time.Time
+	mu                                          sync.Mutex
+	ctx                                         context.Context
+	state                                       client.State
+	tunnel                                      *platform.Tunnel
+	busy, closing, cancelPending, disconnecting bool
+	phase, message                              string
+	stats, diagnostic                           json.RawMessage
+	challenge                                   *ChallengeView
+	cancel                                      context.CancelFunc
+	started                                     time.Time
 }
 
-var ui app
-
-func ptr(s string) *uint16     { p, _ := windows.UTF16PtrFromString(s); return p }
-func text(h uintptr, s string) { setText.Call(h, uintptr(unsafe.Pointer(ptr(s)))) }
-func value(h uintptr) string {
-	n, _, _ := getTextLen.Call(h)
-	b := make([]uint16, n+1)
-	getText.Call(h, uintptr(unsafe.Pointer(&b[0])), n+1)
-	return windows.UTF16ToString(b)
+func (a *Application) startup(ctx context.Context) { a.mu.Lock(); a.ctx = ctx; a.mu.Unlock() }
+func (a *Application) Snapshot() View {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	vk := client.DefaultVKOptions()
+	if a.state.VKOptions != nil {
+		vk = *a.state.VKOptions
+	}
+	route := client.DefaultRouting()
+	if a.state.Routing != nil {
+		route = *a.state.Routing
+	}
+	v := View{ExpiresAt: a.state.ExpiresAt, Version: version, Arch: goruntime.GOARCH, Profiles: []ProfileView{}, Selected: a.state.Selected, Busy: a.busy, Phase: a.phase, Message: a.message, Stats: a.stats, Diagnostic: a.diagnostic, HasSubscription: a.state.SubscriptionURL != "", Revision: a.state.Revision, VK: vk, Routing: route, Captcha: a.challenge}
+	for i, p := range a.state.Profiles {
+		v.Profiles = append(v.Profiles, ProfileView{Index: i, Name: p.Name, Kind: p.Kind, Selected: i == a.state.Selected, Routing: len(p.Routing) > 0 && string(p.Routing) != "null"})
+	}
+	return v
 }
-func (a *app) later(f func()) { a.updates <- f; post.Call(a.hwnd, wmUpdate, 0, 0) }
-func (a *app) control(class, label string, style uintptr, x, y, w, h int32, id int) uintptr {
-	wnd, _, _ := createWindow.Call(0, uintptr(unsafe.Pointer(ptr(class))), uintptr(unsafe.Pointer(ptr(label))), 0x40000000|0x10000000|style, uintptr(x), uintptr(y), uintptr(w), uintptr(h), a.hwnd, uintptr(id), 0, 0)
-	send.Call(wnd, 0x30, a.font, 1)
-	return wnd
+func (a *Application) emit() {
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx != nil {
+		runtime.EventsEmit(ctx, "blink:state", a.Snapshot())
+	}
 }
-func (a *app) save() error {
+func (a *Application) saveLocked() error {
 	b, err := json.Marshal(a.state)
 	if err != nil {
 		return err
 	}
 	return platform.SaveState(b)
 }
-func (a *app) render() {
-	send.Call(a.list, 0x184, 0, 0)
-	for _, p := range a.state.Profiles {
-		send.Call(a.list, 0x180, 0, uintptr(unsafe.Pointer(ptr(p.Name+"  ·  "+p.Kind))))
+func (a *Application) finish(message string) {
+	a.mu.Lock()
+	a.busy = false
+	a.message = message
+	quit := a.closing && a.tunnel == nil
+	ctx := a.ctx
+	a.cancel = nil
+	a.mu.Unlock()
+	a.emit()
+	if quit {
+		runtime.Quit(ctx)
 	}
-	send.Call(a.list, 0x186, uintptr(a.state.Selected), 0)
 }
-func (a *app) selected() int {
-	n, _, _ := send.Call(a.list, 0x188, 0, 0)
-	i := int(int32(n))
-	if i < 0 || i >= len(a.state.Profiles) {
-		return -1
-	}
-	return i
-}
-func (a *app) notice(s string) { text(a.status, s) }
-func (a *app) begin() bool {
-	if a.busy {
-		a.notice("Дождитесь завершения текущей операции")
-		return false
+func (a *Application) begin(message string, offline bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy || a.disconnecting || offline && a.tunnel != nil {
+		return errors.New("Сначала завершите текущую операцию или отключите соединение")
 	}
 	a.busy = true
-	return true
+	a.cancelPending = false
+	a.message = message
+	return nil
 }
-func (a *app) importSource(raw, link string) {
-	if a.tunnel != nil || !a.begin() {
-		return
+func (a *Application) Import(source string) error {
+	if err := a.begin("Проверяем профили…", true); err != nil {
+		return err
+	}
+	a.emit()
+	a.mu.Lock()
+	old := a.state
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.cancel = cancel
+	a.mu.Unlock()
+	defer cancel()
+	raw, link := strings.TrimSpace(source), ""
+	var err error
+	if strings.HasPrefix(raw, "https://") {
+		link = raw
+		raw, err = client.Fetch(ctx, link)
 	}
 	minimum := int64(0)
-	if link != "" && link == a.state.SubscriptionURL {
-		minimum = a.state.Revision
+	if link != "" && link == old.SubscriptionURL {
+		minimum = old.Revision
 	}
-	a.notice("Проверка и импорт профилей…")
-	go func() {
-		var err error
-		if link != "" {
-			raw, err = client.Fetch(context.Background(), link)
-		}
-		var result client.ImportResult
-		if err == nil {
-			result, err = client.Parse(raw, time.Now(), minimum)
-		}
-		a.later(func() {
-			a.busy = false
-			if err != nil {
-				a.notice(err.Error())
-				return
-			}
-			previous := a.state
-			a.state = client.State{Profiles: result.Profiles, Selected: 0, SubscriptionURL: link, Revision: result.Revision}
-			if err = a.save(); err != nil {
-				a.state = previous
-				a.notice(err.Error())
-				return
-			}
-			a.render()
-			text(a.input, "")
-			a.notice(fmt.Sprintf("Импортировано: %d. Отклонено: %d. %s", len(result.Profiles), result.Rejected, result.Notice))
-		})
-	}()
+	var result client.ImportResult
+	if err == nil {
+		result, err = client.Parse(raw, time.Now(), minimum)
+	}
+	if err != nil {
+		a.finish(err.Error())
+		return err
+	}
+	a.mu.Lock()
+	if a.cancelPending || a.closing {
+		a.mu.Unlock()
+		a.finish("Импорт отменён")
+		return nil
+	}
+	a.state = client.State{ExpiresAt: result.ExpiresAt, Profiles: result.Profiles, Selected: 0, SubscriptionURL: link, Revision: result.Revision, VKOptions: old.VKOptions, Routing: old.Routing}
+	err = a.saveLocked()
+	if err != nil {
+		a.state = old
+	}
+	a.mu.Unlock()
+	if err != nil {
+		a.finish("Не удалось сохранить профили")
+		return errors.New("Не удалось сохранить профили")
+	}
+	a.finish(fmt.Sprintf("Добавлено профилей: %d. Отклонено: %d. %s", len(result.Profiles), result.Rejected, result.Notice))
+	return nil
 }
-func (a *app) toggle() {
-	if a.busy {
-		return
+func (a *Application) ImportFile() error {
+	a.mu.Lock()
+	ctx := a.ctx
+	blocked := a.busy || a.tunnel != nil
+	a.mu.Unlock()
+	if blocked {
+		return errors.New("Сначала отключите соединение")
 	}
-	if a.tunnel != nil {
-		a.disconnect("Отключено")
-		return
+	name, err := runtime.OpenFileDialog(ctx, runtime.OpenDialogOptions{Title: "Добавить профили Blink", Filters: []runtime.FileFilter{{DisplayName: "Конфигурации VPN", Pattern: "*.conf;*.json;*.txt;*.yaml;*.yml"}, {DisplayName: "Все файлы", Pattern: "*"}}})
+	if err != nil || name == "" {
+		return err
 	}
-	i := a.selected()
-	if i < 0 {
-		a.notice("Сначала импортируйте и выберите профиль")
-		return
+	f, err := os.Open(name)
+	if err != nil {
+		return errors.New("Не удалось открыть файл")
 	}
-	if !a.begin() {
-		return
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, client.MaxDocument+1))
+	if err != nil || len(b) > client.MaxDocument {
+		return errors.New("Файл не прочитан или превышает 1 МиБ")
+	}
+	return a.Import(string(b))
+}
+func (a *Application) Refresh() error {
+	a.mu.Lock()
+	link := a.state.SubscriptionURL
+	a.mu.Unlock()
+	if link == "" {
+		return errors.New("Сначала добавьте HTTPS-подписку")
+	}
+	return a.Import(link)
+}
+func (a *Application) Select(index int) error {
+	a.mu.Lock()
+	if a.busy || a.tunnel != nil || index < 0 || index >= len(a.state.Profiles) {
+		a.mu.Unlock()
+		return errors.New("Отключитесь, чтобы сменить профиль")
+	}
+	old := a.state.Selected
+	a.state.Selected = index
+	err := a.saveLocked()
+	if err != nil {
+		a.state.Selected = old
+	}
+	a.mu.Unlock()
+	a.emit()
+	return err
+}
+func (a *Application) Delete(index int) error {
+	a.mu.Lock()
+	if a.busy || a.tunnel != nil || index < 0 || index >= len(a.state.Profiles) {
+		a.mu.Unlock()
+		return errors.New("Отключитесь, чтобы изменить профили")
+	}
+	old := a.state
+	profiles := append([]client.Profile(nil), old.Profiles[:index]...)
+	profiles = append(profiles, old.Profiles[index+1:]...)
+	a.state.Profiles = profiles
+	a.state.Selected = 0
+	err := a.saveLocked()
+	if err != nil {
+		a.state = old
+	}
+	a.mu.Unlock()
+	a.emit()
+	return err
+}
+func (a *Application) SaveSettings(vk client.VKOptions, routing client.RoutingOptions) error {
+	if err := vk.Validate(); err != nil {
+		return err
+	}
+	if _, err := routing.Policy(nil); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if a.busy || a.tunnel != nil {
+		a.mu.Unlock()
+		return errors.New("Отключитесь перед изменением настроек")
+	}
+	old := a.state
+	a.state.VKOptions = &vk
+	a.state.Routing = &routing
+	err := a.saveLocked()
+	if err != nil {
+		a.state = old
+	}
+	a.mu.Unlock()
+	a.emit()
+	return err
+}
+func (a *Application) Connect() error {
+	if err := a.begin("Готовим защищённое соединение…", true); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	i := a.state.Selected
+	if i < 0 || i >= len(a.state.Profiles) {
+		a.mu.Unlock()
+		a.finish("Добавьте первый профиль")
+		return errors.New("Добавьте и выберите профиль")
 	}
 	p := a.state.Profiles[i]
-	a.state.Selected = i
-	_ = a.save()
-	a.notice("Подготовка Wintun и транспорта…")
-	go func() {
-		t, err := platform.Start(p)
-		a.later(func() {
-			a.busy = false
-			if err != nil {
-				a.notice(err.Error())
-				return
-			}
-			a.tunnel = t
-			text(a.connect, "Отключить")
-			a.notice("Ожидание готовности транспорта; маршруты ещё не установлены")
-			go a.monitor(t, p)
-		})
-	}()
+	vk := client.DefaultVKOptions()
+	if a.state.VKOptions != nil {
+		vk = *a.state.VKOptions
+	}
+	routing := client.DefaultRouting()
+	if a.state.Routing != nil {
+		routing = *a.state.Routing
+	}
+	a.phase = "connecting"
+	a.diagnostic = nil
+	a.mu.Unlock()
+	a.emit()
+	p, err := client.ConnectionProfile(p, vk, routing)
+	var t *platform.Tunnel
+	if err == nil {
+		t, err = platform.Start(p)
+	}
+	a.mu.Lock()
+	cancelled := a.cancelPending || a.closing
+	if err != nil || cancelled {
+		a.mu.Unlock()
+		if t != nil {
+			_ = t.Close()
+		}
+		a.mu.Lock()
+		a.phase = "disconnected"
+		a.mu.Unlock()
+		if cancelled {
+			a.finish("Подключение отменено")
+			return nil
+		}
+		a.finish(err.Error())
+		return err
+	}
+	a.tunnel = t
+	a.captchaSubmitted = ""
+	a.captchaDeadline = time.Time{}
+	a.started = time.Now()
+	a.mu.Unlock()
+	a.finish("Ожидаем готовности транспорта…")
+	go a.monitor(t, p)
+	return nil
 }
-func (a *app) monitor(t *platform.Tunnel, p client.Profile) {
-	deadline := time.Now().Add(5 * time.Minute)
-	configured := false
-	lastChallenge := ""
+func (a *Application) monitor(t *platform.Tunnel, p client.Profile) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	deadline := time.Now().Add(5 * time.Minute)
+	configured := false
 	for {
 		select {
-		case <-t.Failed:
-			a.later(func() {
-				if a.tunnel == t {
-					a.disconnect("Пакетный интерфейс остановлен")
-				}
-			})
-			return
 		case <-t.Done:
+			return
+		case <-t.Failed:
+			_ = a.Disconnect()
 			return
 		case <-ticker.C:
 		}
 		status := t.Engine.Status()
-		if status == "stopped" || time.Now().After(deadline) && !configured {
-			a.later(func() {
-				if a.tunnel == t {
-					a.disconnect("Транспорт остановлен или превышено время ожидания")
-				}
-			})
+		a.mu.Lock()
+		answerExpired := !a.captchaDeadline.IsZero() && time.Now().After(a.captchaDeadline) && !configured
+		a.mu.Unlock()
+		if answerExpired {
+			_ = a.Disconnect()
+			a.mu.Lock()
+			a.message = "VK не подтвердил готовность за 60 секунд. Подключитесь заново."
+			a.mu.Unlock()
+			a.emit()
 			return
 		}
-		var challenge struct {
-			ID, URL, Image string
-			Expires        int64 `json:"expires_at"`
+		if status == "stopped" || !configured && time.Now().After(deadline) {
+			_ = a.Disconnect()
+			return
 		}
+		var challenge ChallengeView
 		_ = json.Unmarshal([]byte(t.Engine.CaptchaJSON()), &challenge)
-		if challenge.ID != "" && challenge.ID != lastChallenge {
-			lastChallenge = challenge.ID
-			a.later(func() {
-				a.pendingChallenge = challenge.ID
-				a.notice("VK требует ручную CAPTCHA. Современный SDK в этой версии Windows не встроен; можно отменить подключение.")
-				if challenge.Image != "" {
-					a.notice("VK требует код с изображения: нажмите «Открыть проверку», введите код и нажмите «Отправить код»")
-				}
-			})
-		}
-		ready := status == "running" || status == "ready"
-		if ready && !configured {
+		if !configured && (status == "ready" || status == "running") {
 			if err := t.Configure(p); err != nil {
-				a.later(func() {
-					if a.tunnel == t {
-						a.disconnect(err.Error())
-					}
-				})
+				_ = a.Disconnect()
+				a.mu.Lock()
+				a.message = err.Error()
+				a.mu.Unlock()
+				a.emit()
 				return
 			}
 			configured = true
-			a.later(func() {
-				if a.tunnel == t && !a.disconnecting {
-					a.connected = true
-					a.notice("Подключено · " + p.Name)
-				}
-			})
 		}
-		stats := t.Stats()
-		a.later(func() {
-			if a.tunnel == t {
-				text(a.detail, "Ядро: "+status+"\r\n"+stats)
-			}
-		})
+		a.mu.Lock()
+		if a.tunnel != t || a.disconnecting {
+			a.mu.Unlock()
+			return
+		}
+		a.stats = json.RawMessage(t.Engine.StatsJSON())
+		a.challenge = nil
+		if challenge.ID != "" && challenge.ID != a.captchaSubmitted {
+			a.challenge = &challenge
+			a.phase = "captcha"
+			a.message = "Один небольшой шаг. Пройдите проверку VK — Blink продолжит подключение."
+		} else if configured {
+			a.phase = "connected"
+			a.message = "Соединение активно. Ваш профиль готов к работе."
+		} else {
+			a.phase = "connecting"
+		}
+		a.mu.Unlock()
+		a.emit()
 	}
 }
-func (a *app) disconnect(reason string) {
-	if a.tunnel == nil || a.disconnecting {
-		return
+func (a *Application) Disconnect() error {
+	a.mu.Lock()
+	if a.disconnecting {
+		a.mu.Unlock()
+		return nil
+	}
+	t := a.tunnel
+	if t == nil {
+		a.cancelPending = true
+		if a.cancel != nil {
+			a.cancel()
+		}
+		a.mu.Unlock()
+		return nil
 	}
 	a.disconnecting = true
-	t := a.tunnel
 	a.busy = true
-	a.connected = false
-	a.notice("Отключение и восстановление сети…")
-	go func() {
-		err := t.Close()
-		a.later(func() {
-			a.busy = false
-			a.tunnel = nil
-			a.disconnecting = false
-			a.pendingChallenge = ""
-			text(a.connect, "Подключить")
-			text(a.detail, "")
-			text(a.captcha, "")
-			if err != nil {
-				a.notice("Не удалось завершить очистку сети. Нажмите «Восстановить сеть»")
-			} else {
-				a.notice(reason)
-				if a.exiting {
-					user.NewProc("DestroyWindow").Call(a.hwnd)
-				}
-			}
-		})
-	}()
+	a.phase = "disconnecting"
+	a.challenge = nil
+	a.mu.Unlock()
+	a.emit()
+	err := t.Close()
+	a.mu.Lock()
+	a.tunnel = nil
+	a.stats = nil
+	a.challenge = nil
+	a.phase = "disconnected"
+	a.disconnecting = false
+	if err != nil {
+		a.closing = false
+	}
+	a.mu.Unlock()
+	if err != nil {
+		a.finish("Проверьте восстановление сети в настройках")
+		return errors.New("Не все сетевые правила очищены. Используйте восстановление сети")
+	}
+	a.finish("Отключено. Вы готовы к следующему подключению.")
+	return nil
 }
-func (a *app) probe() {
-	if !a.connected || a.tunnel == nil {
-		a.notice("Проверка IP доступна после подключения туннеля")
-		return
-	}
-	if !a.begin() {
-		return
-	}
+func (a *Application) Probe(kind string) error {
+	a.mu.Lock()
 	t := a.tunnel
-	a.notice("Проверка HTTPS через туннель…")
-	go func() {
-		result, err := mobile.ProbeInternet("ip", false, nil)
-		a.later(func() {
-			if a.tunnel != t || a.disconnecting {
-				return
-			}
-			a.busy = false
-			if a.tunnel != t {
-				return
-			}
-			if err != nil {
-				a.notice(err.Error())
-			} else {
-				text(a.detail, result)
-				a.notice("HTTPS через выбранные маршруты: успешно")
-			}
-		})
-	}()
+	connected := a.phase == "connected"
+	a.mu.Unlock()
+	if t == nil || !connected {
+		return errors.New("Сначала подключите туннель")
+	}
+	if err := a.begin("Проверяем HTTPS через соединение…", false); err != nil {
+		return err
+	}
+	a.emit()
+	result, err := mobile.ProbeInternet(kind, false, nil)
+	a.mu.Lock()
+	same := a.tunnel == t && !a.disconnecting
+	if same && err == nil {
+		a.diagnostic = json.RawMessage(result)
+	}
+	a.mu.Unlock()
+	if !same {
+		return nil
+	}
+	if err != nil {
+		a.finish(err.Error())
+		return err
+	}
+	a.finish("Проверка завершена")
+	return nil
 }
-func (a *app) openCaptcha() {
-	if a.tunnel == nil {
+func (a *Application) Recover() error {
+	if err := a.begin("Восстанавливаем настройки сети…", true); err != nil {
+		return err
+	}
+	a.emit()
+	err := platform.Recover()
+	if err != nil {
+		a.finish(err.Error())
+		return err
+	}
+	a.finish("Сеть восстановлена")
+	return nil
+}
+func (a *Application) SubmitCaptcha(id, kind, answer string) error {
+	a.mu.Lock()
+	t := a.tunnel
+	c := a.challenge
+	a.mu.Unlock()
+	if t == nil || c == nil || c.ID != id || c.Expires <= time.Now().Unix() || !t.Engine.SubmitCaptcha(id, kind, answer) {
+		return errors.New("Проверка истекла или ответ не принят")
+	}
+	a.mu.Lock()
+	a.challenge = nil
+	a.captchaSubmitted = id
+	a.captchaDeadline = time.Now().Add(60 * time.Second)
+	a.phase = "connecting"
+	a.message = "Ответ отправлен. Ожидаем подтверждения VK…"
+	a.mu.Unlock()
+	a.emit()
+	return nil
+}
+func (a *Application) beforeClose(ctx context.Context) bool {
+	a.mu.Lock()
+	if a.tunnel == nil && !a.busy {
+		a.mu.Unlock()
+		return false
+	}
+	a.closing = true
+	a.mu.Unlock()
+	go a.Disconnect()
+	return true
+}
+func dialog(s string) {
+	title, _ := windows.UTF16PtrFromString("Blink")
+	body, _ := windows.UTF16PtrFromString(s)
+	windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW").Call(0, uintptr(unsafe.Pointer(body)), uintptr(unsafe.Pointer(title)), 0x10)
+}
+func setWindowIcon() {
+	user := windows.NewLazySystemDLL("user32.dll")
+	kernel := windows.NewLazySystemDLL("kernel32.dll")
+	module, _, _ := kernel.NewProc("GetModuleHandleW").Call(0)
+	hwnd, _, _ := user.NewProc("FindWindowW").Call(uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("BlinkWindows"))), 0)
+	if hwnd == 0 {
 		return
 	}
-	var c struct{ Image string }
-	_ = json.Unmarshal([]byte(a.tunnel.Engine.CaptchaJSON()), &c)
-	if c.Image == "" {
-		a.notice("Современная VK CAPTCHA требует SDK; эта версия Windows его пока не содержит")
-		return
-	}
-	if !strings.HasPrefix(c.Image, "https://") {
-		a.notice("Разрешены только HTTPS-изображения CAPTCHA")
-		return
-	}
-	shell := windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteW")
-	shell.Call(a.hwnd, uintptr(unsafe.Pointer(ptr("open"))), uintptr(unsafe.Pointer(ptr(c.Image))), 0, 0, 1)
-}
-func (a *app) command(id int) {
-	switch id {
-	case idImport:
-		raw := strings.TrimSpace(value(a.input))
-		if strings.HasPrefix(raw, "https://") {
-			a.importSource("", raw)
-		} else {
-			a.importSource(raw, "")
-		}
-	case idRefresh:
-		if a.state.SubscriptionURL == "" {
-			a.notice("В сохранённых профилях нет ссылки подписки")
-		} else {
-			a.importSource("", a.state.SubscriptionURL)
-		}
-	case idFile:
-		a.importFile()
-	case idConnect:
-		a.toggle()
-	case idDelete:
-		if a.tunnel != nil || a.busy {
-			return
-		}
-		i := a.selected()
-		if i < 0 {
-			return
-		}
-		previous := a.state
-		next := append([]client.Profile(nil), a.state.Profiles[:i]...)
-		next = append(next, a.state.Profiles[i+1:]...)
-		a.state.Profiles = next
-		a.state.Selected = 0
-		if err := a.save(); err != nil {
-			a.state = previous
-			a.notice(err.Error())
-		} else {
-			a.render()
-			a.notice("Профиль удалён. Обновление подписки восстановит её список")
-		}
-	case idProbe:
-		a.probe()
-	case idRecover:
-		if a.tunnel != nil || !a.begin() {
-			return
-		}
-		go func() {
-			err := platform.Recover()
-			a.later(func() {
-				a.busy = false
-				if err != nil {
-					a.notice(err.Error())
-				} else {
-					a.notice("Маршруты Blink, DNS и временный IPv6-фильтр очищены")
-				}
-			})
-		}()
-	case idOpenCaptcha:
-		a.openCaptcha()
-	case idCaptcha:
-		if a.tunnel != nil && a.pendingChallenge != "" {
-			ok := a.tunnel.Engine.SubmitCaptcha(a.pendingChallenge, "key", value(a.captcha))
-			text(a.captcha, "")
-			if ok {
-				a.notice("Код отправлен VK, ожидание ответа…")
-			} else {
-				a.notice("Проверка истекла или код не принят")
-			}
+	for _, v := range []struct{ size, kind uintptr }{{32, 1}, {16, 0}} {
+		icon, _, _ := user.NewProc("LoadImageW").Call(module, 2, 1, v.size, v.size, 0x8000)
+		if icon != 0 {
+			user.NewProc("SendMessageW").Call(hwnd, 0x80, v.kind, icon)
 		}
 	}
-}
-func wndProc(h uintptr, msg uint32, w, l uintptr) uintptr {
-	switch msg {
-	case wmCommand:
-		if l != ui.list {
-			ui.command(int(w & 0xffff))
-		}
-		return 0
-	case wmUpdate:
-		for {
-			select {
-			case f := <-ui.updates:
-				f()
-			default:
-				return 0
-			}
-		}
-	case wmClose:
-		if ui.busy {
-			ui.notice("Дождитесь завершения операции, затем закройте окно")
-			return 0
-		}
-		if ui.tunnel != nil {
-			ui.exiting = true
-			ui.disconnect("Отключено")
-			return 0
-		}
-		user.NewProc("DestroyWindow").Call(h)
-		return 0
-	case wmDestroy:
-		user.NewProc("PostQuitMessage").Call(0)
-		return 0
-	}
-	r, _, _ := user.NewProc("DefWindowProcW").Call(h, uintptr(msg), w, l)
-	return r
 }
 func main() {
-	runtime.LockOSThread()
-	// One UI owns the adapter and saved state; a second instance must not clean its routes.
-	mutex, err := windows.CreateMutex(nil, false, ptr("Global\\Blink.Windows.Client"))
+	mutex, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr("Global\\Blink.Windows.Client"))
 	if err == windows.ERROR_ALREADY_EXISTS {
-		windows.CloseHandle(mutex)
+		if mutex != 0 {
+			windows.CloseHandle(mutex)
+		}
 		return
 	}
 	if err != nil {
+		dialog("Не удалось проверить уже запущенный Blink")
 		return
 	}
 	defer windows.CloseHandle(mutex)
@@ -471,65 +549,40 @@ func main() {
 		return
 	}
 	if err = mobile.PrepareAssets(filepath.Join(dir, "assets")); err != nil {
-		dialog("Не удалось подготовить geodata")
+		dialog("Не удалось подготовить ядро Blink")
 		return
 	}
-	var loadErr error
-	if raw, e := platform.LoadState(); e == nil {
-		loadErr = json.Unmarshal(raw, &ui.state)
+	app := &Application{phase: "disconnected", message: "Всё начинается с одного подключения."}
+	if b, e := platform.LoadState(); e == nil {
+		if json.Unmarshal(b, &app.state) != nil {
+			app.message = "Сохранённые профили повреждены"
+		}
 	} else if !errors.Is(e, os.ErrNotExist) {
-		loadErr = e
+		app.message = "Не удалось расшифровать профили текущего пользователя"
 	}
-	ui.updates = make(chan func(), 64)
-	user.NewProc("SetProcessDPIAware").Call()
-	instance, _, _ := kernel.NewProc("GetModuleHandleW").Call(0)
-	name := ptr("BlinkWindows")
-	cursor, _, _ := user.NewProc("LoadCursorW").Call(0, 32512)
-	wc := windowClass{Size: uint32(unsafe.Sizeof(windowClass{})), Proc: syscall.NewCallback(wndProc), Instance: instance, Cursor: cursor, Background: 6, Name: name}
-	user.NewProc("RegisterClassExW").Call(uintptr(unsafe.Pointer(&wc)))
-	ui.hwnd, _, _ = createWindow.Call(0, uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(ptr("Blink · Windows · 0.1.0"))), 0x00ca0000|0x00010000, 100, 100, 800, 790, 0, 0, instance, 0)
-	if ui.hwnd == 0 {
+	// Browser state is transient and never shared with the system browser.
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "webview-session-") {
+			_ = os.RemoveAll(filepath.Join(dir, entry.Name()))
+		}
+	}
+	webviewDir, e := os.MkdirTemp(dir, "webview-session-")
+	if e != nil {
+		dialog("Не удалось создать временное хранилище интерфейса")
 		return
 	}
-	ui.font, _, _ = gdi.NewProc("CreateFontW").Call(18, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
-	defer gdi.NewProc("DeleteObject").Call(ui.font)
-	ui.control("STATIC", "BLINK  /  WINDOWS", 0, 24, 18, 730, 26, 0)
-	ui.control("STATIC", "Вставьте HTTPS-подписку, URI, Xray JSON или WireGuard/AmneziaWG .conf", 0, 24, 52, 730, 24, 0)
-	ui.input = ui.control("EDIT", "", 0x00800000|0x00200000|0x00001000|0x00000004|0x00000040|0x00010000, 24, 80, 730, 108, 0)
-	send.Call(ui.input, 0xc5, client.MaxDocument, 0)
-	ui.control("BUTTON", "Импортировать", 0x10000, 24, 200, 150, 34, idImport)
-	ui.control("BUTTON", "Открыть файл", 0x10000, 184, 200, 150, 34, idFile)
-	ui.control("BUTTON", "Обновить подписку", 0x10000, 344, 200, 200, 34, idRefresh)
-	ui.control("STATIC", "Профили  ·  импорт заменяет текущий список", 0, 24, 248, 730, 24, 0)
-	ui.list = ui.control("LISTBOX", "", 0x00800000|0x00200000|0x00010000|1, 24, 276, 730, 150, 0)
-	ui.connect = ui.control("BUTTON", "Подключить", 0x10000, 24, 438, 180, 40, idConnect)
-	ui.control("BUTTON", "Проверить IP", 0x10000, 214, 438, 170, 40, idProbe)
-	ui.control("BUTTON", "Удалить", 0x10000, 394, 438, 140, 40, idDelete)
-	ui.control("BUTTON", "Восстановить сеть", 0x10000, 544, 438, 210, 40, idRecover)
-	ui.status = ui.control("STATIC", "Отключено. Для подключения запустите от имени администратора.", 0, 24, 492, 730, 62, 0)
-	ui.detail = ui.control("EDIT", "", 0x00000800|0x00000004, 24, 558, 730, 62, 0)
-	ui.captcha = ui.control("EDIT", "", 0x00800000|0x00010000|0x20, 24, 638, 230, 30, 0)
-	ui.control("BUTTON", "Отправить код", 0x10000, 266, 636, 180, 34, idCaptcha)
-	ui.control("BUTTON", "Открыть проверку", 0x10000, 458, 636, 210, 34, idOpenCaptcha)
-	ui.control("STATIC", "IPv4 · Wintun · без автозапуска · профили защищены Windows DPAPI", 0, 24, 688, 730, 24, 0)
-	ui.render()
-	if loadErr != nil {
-		ui.notice("Не удалось прочитать сохранённые профили: " + loadErr.Error())
-	}
-	user.NewProc("ShowWindow").Call(ui.hwnd, 1)
-	var m message
-	for {
-		r, _, _ := user.NewProc("GetMessageW").Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
-		if int32(r) <= 0 {
-			break
+	defer os.RemoveAll(webviewDir)
+	files, _ := fs.Sub(assets, "ui")
+	err = wails.Run(&options.App{Title: "Blink", Width: 1160, Height: 820, MinWidth: 760, MinHeight: 660, BackgroundColour: options.NewRGB(8, 13, 24), AssetServer: &assetserver.Options{Assets: files}, Bind: []interface{}{app}, OnStartup: app.startup, OnDomReady: func(context.Context) { setWindowIcon(); app.emit() }, OnBeforeClose: app.beforeClose, OnShutdown: func(context.Context) {
+		app.mu.Lock()
+		t := app.tunnel
+		app.mu.Unlock()
+		if t != nil {
+			_ = t.Close()
 		}
-		handled, _, _ := user.NewProc("IsDialogMessageW").Call(ui.hwnd, uintptr(unsafe.Pointer(&m)))
-		if handled == 0 {
-			user.NewProc("TranslateMessage").Call(uintptr(unsafe.Pointer(&m)))
-			user.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&m)))
-		}
+	}, Windows: &wwindows.Options{Theme: wwindows.Dark, WebviewUserDataPath: webviewDir, DisablePinchZoom: true, WindowClassName: "BlinkWindows", DLLSearchPaths: wwindows.DLLSearchApplicationDir | wwindows.DLLSearchSystem32}, EnableDefaultContextMenu: false})
+	if err != nil {
+		dialog("Не удалось открыть Blink. Проверьте установку Microsoft Edge WebView2 Runtime.")
 	}
-}
-func dialog(s string) {
-	user.NewProc("MessageBoxW").Call(0, uintptr(unsafe.Pointer(ptr(s))), uintptr(unsafe.Pointer(ptr("Blink"))), 0x10)
 }
