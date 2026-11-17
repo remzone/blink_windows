@@ -5,24 +5,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/remzone/blink_windows/internal/diagnostics"
 )
 
 type shellEvent struct {
-	Step         string `json:"step"`
-	OK           bool   `json:"ok"`
-	Count        int    `json:"count"`
-	HRESULT      int64  `json:"hresult"`
-	NativeError  int64  `json:"nativeError,omitempty"`
-	InnerHRESULT int64  `json:"innerHresult,omitempty"`
-	ErrorID      string `json:"errorId,omitempty"`
-	Category     string `json:"category,omitempty"`
-	Exception    string `json:"exception,omitempty"`
+	Step          string `json:"step"`
+	OK            bool   `json:"ok"`
+	Count         int    `json:"count"`
+	SystemHRESULT uint32 `json:"systemHresult,omitempty"`
+	HRESULT       int64  `json:"hresult"`
+	NativeError   int64  `json:"nativeError,omitempty"`
+	InnerHRESULT  int64  `json:"innerHresult,omitempty"`
+	ErrorID       string `json:"errorId,omitempty"`
+	Category      string `json:"category,omitempty"`
+	Exception     string `json:"exception,omitempty"`
 }
 
 var cleanupLabels = map[string]string{"nrpt": "правила DNS (NRPT)", "cache": "кэш DNS", "firewall": "брандмауэр", "adapter": "поиск адаптера", "adapter_dns": "DNS адаптера", "addresses": "адреса адаптера", "routes": "маршруты адаптера"}
+var systemHRESULT = regexp.MustCompile(`(?i)\bHRESULT 0x([0-9a-f]{8})\b`)
+
 var technicalID = regexp.MustCompile(`^[A-Za-z0-9_.,:+ -]{1,192}$`)
 
 // Only our ASCII JSON markers are accepted. PowerShell's raw CLIXML and error
@@ -52,6 +56,10 @@ func parseShellEvents(raw []byte, prefix string, labels map[string]string) []she
 			if !technicalID.MatchString(*id) {
 				*id = ""
 			}
+		}
+		if m := systemHRESULT.FindStringSubmatch(e.ErrorID); len(m) == 2 {
+			v, _ := strconv.ParseUint(m[1], 16, 32)
+			e.SystemHRESULT = uint32(v)
 		}
 		events = append(events, e)
 		if len(events) == 32 {

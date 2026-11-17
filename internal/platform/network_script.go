@@ -9,9 +9,8 @@ import (
 	"github.com/remzone/blink_windows/internal/client"
 )
 
-// buildNetworkScript is called only after validateNetwork. Keep the firewall
-// address keyword separate from route CIDRs: MS-FASP permits IPv6 subnet prefix
-// lengths 1..128; ::/0 is a route, but cannot be used as a firewall subnet.
+// buildNetworkScript is called only after validateNetwork. IPv6 filtering is
+// installed through the tunnel-owned dynamic WFP session, before installing OS routes.
 func buildNetworkScript(p client.Profile) string {
 	script := `$blinkStep='adapter';$a=Get-NetAdapter -Name 'Blink';$i=$a.ifIndex;Get-NetRoute -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;Get-NetIPAddress -InterfaceIndex $i -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;`
 	if hasIPv6(p) {
@@ -58,9 +57,6 @@ func buildNetworkScript(p client.Profile) string {
 	}
 	if full {
 		script += "$blinkStep='nrpt';Add-DnsClientNrptRule -Namespace '.' -NameServers @(" + strings.Join(dns, ",") + ") -Comment 'Blink.Windows temporary';Clear-DnsClientCache;"
-		if !hasIPv6(p) {
-			script += `$blinkStep='firewall';New-NetFirewallRule -Name 'Blink-IPv6' -DisplayName 'Blink IPv6 while connected' -Direction Outbound -Action Block -RemoteAddress 'Any6' -Profile Any -Enabled True -ErrorAction Stop -PolicyStore PersistentStore | Out-Null;`
-		}
 	}
 	script = shellErrorFunction + "try {" + script + `} catch {Write-BlinkError 'BLINK_NETWORK' $blinkStep $_;[Console]::Error.WriteLine(('BLINK_STEP='+$blinkStep+';BLINK_HRESULT='+$_.Exception.HResult));exit 1}`
 	return script
@@ -70,6 +66,18 @@ func hasIPv6(p client.Profile) bool {
 	for _, s := range p.Addresses {
 		a, e := netip.ParsePrefix(s)
 		if e == nil && a.Addr().Is6() {
+			return true
+		}
+	}
+	return false
+}
+
+func needsIPv6Guard(p client.Profile) bool {
+	if hasIPv6(p) {
+		return false
+	}
+	for _, route := range p.Routes {
+		if route == "0.0.0.0/0" {
 			return true
 		}
 	}

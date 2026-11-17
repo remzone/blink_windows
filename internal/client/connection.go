@@ -44,7 +44,7 @@ func (t *ConnectionTrace) SetStage(stage string, now time.Time) {
 	if t.Stage == stage {
 		return
 	}
-	descriptions := map[string]string{"recovery": "Очищаем оставшиеся правила сети Blink", "adapter": "Создаём сетевой адаптер Windows", "engine": "Запускаем VPN-ядро", "transport": "Устанавливаем транспорт TURN", "network": "Применяем адреса, DNS и маршруты Windows", "captcha": "Ожидаем ручную проверку", "connected": "Сетевой интерфейс настроен", "stopping": "Останавливаем соединение и очищаем сеть", "disconnected": "Соединение остановлено"}
+	descriptions := map[string]string{"recovery": "Очищаем оставшиеся правила сети Blink", "filter": "Включаем временную защиту IPv6", "adapter": "Создаём сетевой адаптер Windows", "engine": "Запускаем VPN-ядро", "transport": "Устанавливаем транспорт TURN", "network": "Применяем адреса, DNS и маршруты Windows", "captcha": "Ожидаем ручную проверку", "connected": "Сетевой интерфейс настроен", "stopping": "Останавливаем соединение и очищаем сеть", "disconnected": "Соединение остановлено"}
 	t.Stage = stage
 	t.Detail = descriptions[stage]
 	t.add("windows."+stage, nil, now)
@@ -141,6 +141,8 @@ func (t ConnectionTrace) TimeoutMessage() string {
 		return "Windows не завершила очистку прежних правил Blink за 30 секунд. Выполните восстановление сети в настройках и сохраните отчёт."
 	case "adapter":
 		return "Windows не завершила создание адаптера за 45 секунд. Проверьте драйвер Wintun, права администратора и конфликт с другим VPN."
+	case "filter":
+		return "Windows не завершила включение временной защиты IPv6 за 15 секунд. Подключение отменено; подробности — в файле журнала."
 	case "engine":
 		return "VPN-ядро не запустилось за 45 секунд. Подключение отменено; сохраните отчёт подключения."
 	case "network":

@@ -22,6 +22,7 @@ import (
 
 	"github.com/remzone/blink_windows/internal/client"
 	"github.com/remzone/blink_windows/internal/diagnostics"
+	"github.com/remzone/blink_windows/internal/wfp"
 	"github.com/remzone/blink_windows/native/mobile"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
@@ -114,6 +115,7 @@ func (p Protector) Protect(fd int64) bool {
 }
 
 type Tunnel struct {
+	Filter    *wfp.Session
 	mu        sync.Mutex
 	Device    tun.Device
 	Engine    *mobile.Engine
@@ -225,9 +227,10 @@ func start(ctx context.Context, p client.Profile, report func(string)) (*Tunnel,
 		_ = d.Close()
 		return nil, err
 	}
-	report("engine")
 	t := &Tunnel{Device: d, Protector: Protector{Index: index, Index6: index6}, Done: make(chan struct{}), Failed: make(chan struct{})}
 	fail := func(err error) (*Tunnel, error) { t.Close(); return nil, err }
+
+	report("engine")
 	if p.Kind == "vk" {
 		t.Engine, err = mobile.StartVK(string(p.Raw), t, t.Protector)
 	} else {
@@ -247,7 +250,7 @@ func start(ctx context.Context, p client.Profile, report func(string)) (*Tunnel,
 	// VK must be ready before installing any VPN routes. CAPTCHA is available meanwhile.
 	return t, nil
 }
-func (t *Tunnel) Configure(ctx context.Context, p client.Profile) error {
+func (t *Tunnel) Configure(ctx context.Context, p client.Profile, report func(string)) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	select {
@@ -259,6 +262,24 @@ func (t *Tunnel) Configure(ctx context.Context, p client.Profile) error {
 	if err := validateNetwork(p); err != nil {
 		return err
 	}
+	if needsIPv6Guard(p) && t.Filter == nil {
+		report("filter")
+		filterCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		guard, err := awaitStart(filterCtx, startGate, wfp.New, func(s *wfp.Session) {
+			if s != nil {
+				_ = s.Close()
+			}
+		})
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return errors.New("Windows не включила временную защиту IPv6 за 15 секунд. Подключение отменено; подробности — в файле журнала")
+			}
+			return err
+		}
+		t.Filter = guard
+	}
+	report("network")
 	script := buildNetworkScript(p)
 	if _, err := powershellContext(ctx, script); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -295,6 +316,9 @@ func (t *Tunnel) Close() error {
 		_ = t.Device.Close()
 		if t.Engine != nil {
 			t.Engine.Stop()
+		}
+		if t.Filter != nil {
+			result = errors.Join(result, t.Filter.Close())
 		}
 	})
 	return result
@@ -357,6 +381,9 @@ func networkConfigurationError(err error) error {
 		for _, e := range networkEvents(failure.Stderr) {
 			if !e.OK {
 				code := fmt.Sprintf("HRESULT 0x%08X", uint32(e.HRESULT))
+				if e.SystemHRESULT != 0 {
+					code = fmt.Sprintf("Windows 0x%08X", e.SystemHRESULT)
+				}
 				if e.NativeError != 0 {
 					code += fmt.Sprintf(", CIM %d", e.NativeError)
 				}

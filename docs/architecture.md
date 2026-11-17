@@ -1,4 +1,4 @@
-# Архитектура 0.3.0-preview.3
+# Архитектура 0.3.0-preview.4
 
 `cmd/blink/main_windows.go` — desktop host Wails 2.17.1/WebView2 и lifecycle/controller. `cmd/blink/ui` — встроенные HTML/CSS/JS, SVG-иконки и закреплённый официальный SDK ручной проверки. Node не нужен для сборки готовых assets. Привилегированные Go bindings разрешены только локальному origin приложения; удалённый CAPTCHA iframe их не получает.
 
@@ -33,11 +33,11 @@ flowchart LR
 
 Vokop v3 и `routing` преобразуются в `mobile.RoutingPolicy`, строго валидируются и передаются соответствующий метод общего ядра. Личные включения/исключения объединяются с серверными. Для all+exclusions формируется selected IPv4-политика с двумя `/1`, чтобы исключения не игнорировались native all-mode.
 
-Полные OS routes также задаются двумя `/1` каждого семейства с сохранением физического default route. Более специфичные локальные маршруты продолжают действовать. Full IPv4 без явного IPv6-адреса добавляет правило Firewall для IPv6; полный профиль WG с явным IPv6 его не блокирует. NRPT задаёт DNS профиля для системного резолвера. Выборочный маршрутизатор ядра использует IPv4; IPv6+selected отклоняется.
+Полные OS routes также задаются двумя `/1` каждого семейства с сохранением физического default route. Более специфичные локальные маршруты продолжают действовать. Full IPv4 без явного IPv6-адреса открывает динамическую WFP-сессию для защиты IPv6 перед установкой OS routes; полный профиль WG с явным IPv6 его не блокирует. NRPT задаёт DNS профиля для системного резолвера. Выборочный маршрутизатор ядра использует IPv4; IPv6+selected отклоняется.
 
 ## Очистка и хранение
 
-Конфигурация и Close сериализованы отдельным mutex. Очистка пытается выполнить каждую независимую операцию, даже если другая заблокирована политикой Windows. Она затрагивает только собственное NRPT, Firewall `Blink-IPv6` и интерфейс `Blink`. Ошибка очистки оставляет приложение доступным для Recover. Авария требует повторного запуска/`--recover`; постоянного kill switch и службы нет.
+Конфигурация и Close сериализованы отдельным mutex. Очистка пытается выполнить каждую независимую операцию, даже если другая заблокирована политикой Windows. Она затрагивает только собственное NRPT, наследованное Firewall-правило `Blink-IPv6` и интерфейс `Blink`; динамическая WFP-сессия принадлежит объекту Tunnel и закрывается после остановки ядра/адаптера. Ошибка очистки оставляет приложение доступным для Recover. Авария требует повторного запуска/`--recover`; постоянного kill switch и службы нет.
 
 Состояние зашифровано DPAPI CurrentUser, записывается через временный файл, sync и MoveFileEx replacement. Формат 0.1.0 совместим: новые поля необязательны, старые настройки получают defaults. Перенос ciphertext в другую учётную запись не поддерживается.
 
@@ -79,10 +79,21 @@ Snapshot передаёт ID/имя/тип/счётчик источника и 
 `internal/diagnostics` — синхронизированный JSONL writer с немедленным Sync, append между запусками и ротацией двух файлов по 1 МиБ. Инициализация до ядра/`--recover`, путь `%APPDATA%\Blink\logs\blink.log`. Старт записывает build Windows, архитектуру, версию и admin status. ConnectionTrace пишет только нормализованные события и числа. PowerShell получает отдельные stdout/stderr; процесс пишет длительность, exit code, timeout/cancel и числовой Win32-код, если он доступен. Для Configure разбирается фиксированный JSON-маркер: этап, HRESULT, внутренний HRESULT, CIM-код, категория и технические идентификаторы исключения; прежний числовой маркер сохраняется для совместимости. Для cleanup разбираются собственные JSON-маркеры с фиксированными шагами, числовыми кодами и проверенными техническими идентификаторами; сырой stderr никогда не копируется в журнал. Скрипты, URL и State не логируются. Ошибка файла видна через безопасные поля Snapshot, открытие папки использует только фиксированный локальный путь.
 
 
-## Исправление фильтра Firewall в preview.3
+## Попытка исправления Firewall в preview.3 (отозвана)
 
-Полный IPv4-профиль создаёт outbound Block-правило `Blink-IPv6` с `RemoteAddress=Any6`, `Profile=Any`, `Enabled=True`. Это фильтр именно IPv6; IPv4 не блокируется. Dual-stack WG с явным IPv6-адресом и выборочные OS routes не создают этот глобальный фильтр. Неуспешное создание остаётся ошибкой, после которой выполняется обычная очистка.
+В preview.3 полный IPv4-профиль создавал outbound Block-правило `Blink-IPv6` с `RemoteAddress=Any6`, `Profile=Any`, `Enabled=True`. На пользовательском Windows эта команда также вернула 0x80070057 InvalidArgument; в preview.4 этот путь исключён. Это фильтр именно IPv6; IPv4 не блокируется. Dual-stack WG с явным IPv6-адресом и выборочные OS routes не создают этот глобальный фильтр. Неуспешное создание остаётся ошибкой, после которой выполняется обычная очистка.
 
 Раньше передавался маршрутный CIDR `::/0`. [MS-FASP, FW_IPV6_SUBNET](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fasp/ccb501eb-6620-4b49-befd-2b59828a28c8) требует длину IPv6-префикса Firewall 1..128; `0` недопустим. [New-NetFirewallRule, RemoteAddress](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule#-remoteaddress) документирует keyword `Any` с суффиксом `6` для ограничения семейства. В пользовательском логе сбой находится именно на этом вызове, однако старый внешний HRESULT 0x80131500 не уточняет собственный CIM/Win32-код. Поэтому новая версия сохраняет дополнительные коды, если отказ вызван ещё и политиками/службами.
 
 Native `native.xray.error` исторически содержит поле `errorCode`, которое на деле равно Xray Severity (1 Error, 2 Warning, 3 Info). Windows нормализует имя события по этому полю без форматирования исходного сообщения. Одиночное предупреждение с неизвестной категорией не устанавливает состояние failed; штатный Xray startup тоже использует Warning.
+
+
+## Временная защита IPv6 через WFP (preview.4)
+
+`internal/wfp` использует системную `fwpuclnt.dll`: dynamic session, собственный непостоянный sublayer, транзакцию добавления фильтров. Только слой `ALE_AUTH_CONNECT_V6`; IPv4 layers не меняются. Внутри своего sublayer приоритетные soft permit-фильтры для AppID текущего Blink, loopback, NDP 133/135/136 code 0 и DHCPv6 UDP 546→547, затем общий block. AppID получается через FwpmGetAppIdFromFileName0 без логирования пути; эти permits не обходят блокировки других sublayers. Физические binding/service settings не меняются. Новый пакет не использует адресные keywords/CIDR NetSecurity.
+
+Сессия создаётся в Configure после готовности ядра/транспорта и до адресов/DNS/маршрутов. Ожидание до 15 секунд обёрнуто в тот же механизм отмены и запрета повторного запуска, что драйвер: запоздалая сессия закрывается, gate освобождается после cleanup. Tunnel хранит принятый handle и закрывает сессию после сетевой очистки и остановки core/device. Ошибка Begin/Install/Commit откатывает транзакцию и закрывает dynamic session. Процесс Windows автоматически теряет все её объекты и при аварийном завершении.
+
+WFP возвращает DWORD напрямую; wrapper не использует GetLastError. Журнал фиксирует `backend=wfp`, `step`, `win32`, состояние сессии, начало/завершение отдельных API-вызовов, их DWORD status и длительность; аргументы и AppID не записываются. ABI layouts и 32-битные padding адаптированы из закреплённого WireGuard Windows v1.1.1 (MIT); compile-time assertions сверяют размеры/ключевые offsets для обеих архитектур. Syscall wrapper помечен `go:uintptrescapes`, указатели сохраняются живыми до возврата из API. Использованные buffers уходят в heap перед потенциальным перемещением Go stack.
+
+Официальные источники: [dynamic session lifetime](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmengineopen0), [WFP transactions](https://learn.microsoft.com/en-us/windows/win32/fwp/object-management), [filter arbitration](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration), [ALE layers](https://learn.microsoft.com/en-us/windows/win32/fwp/ale-layers). Код адаптации не заявляет полноценный kill switch для IPv4.

@@ -20,6 +20,7 @@ Blink Windows integration is GPL-3.0-only; see LICENSE. Dependencies retain thei
 | WebView2 bindings | github.com/wailsapp/go-webview2 v1.0.22; MIT and embedded loader notices |
 | Manual challenge SDK | @vkid/captcha 2.0.0, V Kontakte LLC; MIT; cmd/blink/ui/vendor/CAPTCHA-LICENSE.txt and UPSTREAM.json |
 | Country flags | flag-icons 7.5.0, Panayiotis Lipiridis; MIT; cmd/blink/ui/vendor/FLAG-ICONS-LICENSE.txt and FLAG-ICONS-UPSTREAM.json |
+| Windows Filtering Platform ABI layouts | Adapted from golang.zx2c4.com/wireguard/windows v1.1.1, Copyright (C) 2019-2026 WireGuard LLC; MIT; internal/wfp/LICENSE, WFP-LICENSE.txt in packages |
 | Windows IP Helper bindings | golang.zx2c4.com/wireguard/windows/tunnel/winipcfg v1.1.1; MIT |
 | Manifest resource generator (build only) | github.com/akavel/rsrc v0.10.2; MIT |
 

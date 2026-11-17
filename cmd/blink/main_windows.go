@@ -34,7 +34,7 @@ import (
 //go:embed ui/*
 var assets embed.FS
 
-const version = "0.3.0-preview.3"
+const version = "0.3.0-preview.4"
 
 type SourceView struct {
 	ID          string `json:"id"`
@@ -534,7 +534,7 @@ func (a *Application) monitor(ctx context.Context, t *platform.Tunnel, p client.
 		}
 		if !configured && (status == "ready" || status == "running") {
 			a.reportStage(attempt, "network")
-			if err := t.Configure(ctx, p); err != nil {
+			if err := t.Configure(ctx, p, func(stage string) { a.reportStage(attempt, stage) }); err != nil {
 				if ctx.Err() == nil {
 					a.failConnection(t, "NETWORK_CONFIG_FAILED", err.Error())
 				}

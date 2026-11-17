@@ -9,7 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / 'dist'
-VERSION = '0.3.0-preview.3'
+VERSION = '0.3.0-preview.4'
 SHA256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
 URL = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
 
@@ -58,6 +58,7 @@ def main():
         for name in ['README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md']:
             shutil.copy2(ROOT / name, package / name)
         shutil.copytree(ROOT / 'docs', package / 'docs')
+        shutil.copy2(ROOT / 'internal/wfp/LICENSE', package / 'WFP-LICENSE.txt')
         shutil.copy2(ROOT / 'cmd/blink/ui/vendor/CAPTCHA-LICENSE.txt', package)
         shutil.copy2(ROOT / 'cmd/blink/ui/vendor/FLAG-ICONS-LICENSE.txt', package)
         output = Path(shutil.make_archive(str(package), 'zip', DIST, package.name))
