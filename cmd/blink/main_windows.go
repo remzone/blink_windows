@@ -33,7 +33,7 @@ import (
 //go:embed ui/*
 var assets embed.FS
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 type ProfileView struct {
 	Index    int    `json:"index"`
@@ -351,7 +351,7 @@ func (a *Application) monitor(t *platform.Tunnel, p client.Profile) {
 		if answerExpired {
 			_ = a.Disconnect()
 			a.mu.Lock()
-			a.message = "VK не подтвердил готовность за 60 секунд. Подключитесь заново."
+			a.message = "Транспорт не подтвердил готовность за 60 секунд. Подключитесь заново."
 			a.mu.Unlock()
 			a.emit()
 			return
@@ -383,7 +383,7 @@ func (a *Application) monitor(t *platform.Tunnel, p client.Profile) {
 		if challenge.ID != "" && challenge.ID != a.captchaSubmitted {
 			a.challenge = &challenge
 			a.phase = "captcha"
-			a.message = "Один небольшой шаг. Пройдите проверку VK — Blink продолжит подключение."
+			a.message = "Один небольшой шаг. Пройдите проверку — Blink продолжит подключение."
 		} else if configured {
 			a.phase = "connected"
 			a.message = "Соединение активно. Ваш профиль готов к работе."
@@ -488,7 +488,7 @@ func (a *Application) SubmitCaptcha(id, kind, answer string) error {
 	a.captchaSubmitted = id
 	a.captchaDeadline = time.Now().Add(60 * time.Second)
 	a.phase = "connecting"
-	a.message = "Ответ отправлен. Ожидаем подтверждения VK…"
+	a.message = "Ответ отправлен. Ожидаем подтверждения…"
 	a.mu.Unlock()
 	a.emit()
 	return nil

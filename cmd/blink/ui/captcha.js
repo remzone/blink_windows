@@ -11,7 +11,7 @@ window.BlinkCaptcha={mount(challenge,container,onSuccess,onError){
  const stop=()=>{active=false;widget.destroy();container.replaceChildren()};
  widget.show({link:link.href,container,view:'block',scheme:'dark',lang:'ru',onClose:()=>{if(active)onError('Проверка закрыта. Можно открыть её заново или отменить подключение.')}}).then(token=>{
   if(!active||submitted||challenge.expires_at*1000<=Date.now())return;
-  if(typeof token!=='string'||!token.length||token.length>16384||/[\r\n\0]/.test(token)){onError('VK вернул некорректный ответ');return}
+  if(typeof token!=='string'||!token.length||token.length>16384||/[\r\n\0]/.test(token)){onError('Сервис проверки вернул некорректный ответ');return}
   submitted=true;onSuccess(token);
  }).catch(()=>{if(active)onError('Проверка не завершена. Повторите её или отмените подключение.')});
  return {destroy:stop};

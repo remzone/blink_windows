@@ -12,7 +12,7 @@ const arch=process.argv[2]||'amd64',root=path.resolve(__dirname,'..'),dir=path.j
   for(let i=0;i<60;i++){page=context.pages().find(p=>p.url().includes('wails'));if(page)break;await new Promise(r=>setTimeout(r,300))}assert(page,'Application document did not load');
   await page.waitForFunction(()=>!!window.go?.main?.Application,{timeout:30000});const snapshot=await page.evaluate(()=>window.go.main.Application.Snapshot());assert.equal(snapshot.arch,arch);assert.equal(snapshot.phase,'disconnected');assert.deepEqual(snapshot.profiles,[]);assert(!('subscriptionURL' in snapshot));
   await page.locator('[data-page=profiles]').click();await page.locator('#empty-add').click();await page.locator('#import-input').fill('vless://00000000-0000-4000-8000-000000000001@vpn.example.org:443?type=tcp&security=tls&sni=vpn.example.org#Windows%20smoke%20fixture');await page.locator('#import-form button[type=submit]').click();await page.locator('.profile-row').waitFor();
-  assert.equal(await page.locator('.profile-copy strong').innerText(),'Windows smoke fixture');
+  assert.equal(await page.locator('#profile-list .profile-copy strong').innerText(),'Windows smoke fixture');
   const stateFile=path.join(dir,'Blink','profiles.dpapi');assert(fs.existsSync(stateFile));assert(!fs.readFileSync(stateFile).includes(Buffer.from('00000000-0000-4000-8000-000000000001')));
   await page.locator('[data-page=settings]').click();await page.locator('#server-defaults').uncheck();await page.locator('#vk-transport').selectOption('tcp');await page.locator('#settings-form button[type=submit]').click();await page.locator('#toast').filter({hasText:'Настройки сохранены'}).waitFor();
   assert.equal((await page.evaluate(()=>window.go.main.Application.Snapshot())).vk.transport,'tcp');

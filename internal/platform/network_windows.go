@@ -22,11 +22,12 @@ import (
 	"github.com/remzone/blink_windows/native/mobile"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 // Only the Blink interface is changed; the physical adapter is never reconfigured.
 func powershell(script string) ([]byte, error) {
-	codes := utf16.Encode([]rune("$ErrorActionPreference='Stop';" + script))
+	codes := utf16.Encode([]rune("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';" + script))
 	b := make([]byte, 2*len(codes))
 	for i, c := range codes {
 		binary.LittleEndian.PutUint16(b[2*i:], c)
@@ -40,7 +41,8 @@ func powershell(script string) ([]byte, error) {
 	exe := filepath.Join(systemDir, "WindowsPowerShell", "v1.0", "powershell.exe")
 	cmd := exec.CommandContext(ctx, exe, "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(b))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return cmd.CombinedOutput()
+	// Keep PowerShell progress/CLIXML on stderr out of successful stdout.
+	return cmd.Output()
 }
 func Admin() bool {
 	var sid *windows.SID
@@ -144,20 +146,16 @@ func Start(p client.Profile) (*Tunnel, error) {
 		return nil, errors.New("Нет подходящего подписанного wintun.dll рядом с Blink.exe")
 	}
 	defer windows.FreeLibrary(handle)
-	out, err := powershell(`$r=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {$_.InterfaceAlias -ne 'Blink'} | Sort-Object @{Expression={$_.RouteMetric+(Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric}} | Select-Object -First 1;if(!$r){throw 'No physical IPv4 default route'};$r.InterfaceIndex`)
+	index, err := defaultInterface(windows.AF_INET)
 	if err != nil {
-		return nil, errors.New("Не найден физический IPv4-маршрут")
+		return nil, fmt.Errorf("Не удалось определить сетевой адаптер: %w", err)
 	}
-	var index uint32
-	if _, err = fmt.Sscan(strings.TrimSpace(string(out)), &index); err != nil || index == 0 {
-		return nil, errors.New("Не найден индекс физического интерфейса")
+	if index == 0 {
+		return nil, errors.New("Нет активного IPv4-маршрута в интернет. Проверьте Wi-Fi или Ethernet и повторите подключение")
 	}
-	index6 := index
-	if out6, e := powershell(`$r=Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' | Where-Object {$_.InterfaceAlias -ne 'Blink'} | Sort-Object RouteMetric | Select-Object -First 1;if($r){$r.InterfaceIndex}`); e == nil {
-		var n uint32
-		if _, e = fmt.Sscan(strings.TrimSpace(string(out6)), &n); e == nil && n > 0 {
-			index6 = n
-		}
+	index6, _ := defaultInterface(windows.AF_INET6)
+	if index6 == 0 {
+		index6 = index
 	}
 	d, err := tun.CreateTUN("Blink", p.MTU)
 	if err != nil {
@@ -309,4 +307,33 @@ func (t *Tunnel) Stats() string {
 	}
 	_ = json.Unmarshal([]byte(t.Engine.StatsJSON()), &s)
 	return fmt.Sprintf("Отправлено %.2f МиБ   ·   Получено %.2f МиБ", float64(s.TX)/(1<<20), float64(s.RX)/(1<<20))
+}
+
+// Read the routing table directly: console encoding, CLIXML and localization
+// must never participate in selecting an adapter for protected transport sockets.
+func defaultInterface(family winipcfg.AddressFamily) (uint32, error) {
+	routes, err := winipcfg.GetIPForwardTable2(family)
+	if err != nil {
+		return 0, err
+	}
+	var candidates []routeCandidate
+	for _, r := range routes {
+		prefix := r.DestinationPrefix.Prefix()
+		if !prefix.IsValid() || prefix.Bits() != 0 || !prefix.Addr().IsUnspecified() || r.Loopback || r.ValidLifetime == 0 {
+			continue
+		}
+		adapter, err := r.InterfaceLUID.Interface()
+		if err != nil {
+			continue
+		}
+		ip, err := r.InterfaceLUID.IPInterface(family)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, routeCandidate{
+			Index: r.InterfaceIndex, Alias: adapter.Alias(), Up: adapter.OperStatus == winipcfg.IfOperStatusUp && ip.Connected,
+			RouteMetric: r.Metric, InterfaceMetric: ip.Metric,
+		})
+	}
+	return chooseDefaultInterface(candidates), nil
 }

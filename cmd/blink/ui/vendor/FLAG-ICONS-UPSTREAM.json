@@ -1,0 +1,8 @@
+{
+  "package": "flag-icons",
+  "version": "7.5.0",
+  "source": "https://github.com/lipis/flag-icons",
+  "archive": "https://registry.npmjs.org/flag-icons/-/flag-icons-7.5.0.tgz",
+  "sha256": "c0b80bf0e08006a60f56621d6bc49f8c7131f4d1fef6737a165a673431f4b518",
+  "files": "flags/4x3/[a-z][a-z].svg; unmodified"
+}

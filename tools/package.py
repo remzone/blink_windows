@@ -9,7 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / 'dist'
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 SHA256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
 URL = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
 
@@ -59,6 +59,7 @@ def main():
             shutil.copy2(ROOT / name, package / name)
         shutil.copytree(ROOT / 'docs', package / 'docs')
         shutil.copy2(ROOT / 'cmd/blink/ui/vendor/VKID-CAPTCHA-LICENSE.txt', package)
+        shutil.copy2(ROOT / 'cmd/blink/ui/vendor/FLAG-ICONS-LICENSE.txt', package)
         output = Path(shutil.make_archive(str(package), 'zip', DIST, package.name))
         digest = hashlib.sha256(output.read_bytes()).hexdigest()
         sums.append(f'{digest}  {output.name}')

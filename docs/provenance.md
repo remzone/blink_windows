@@ -25,3 +25,7 @@
 Официальный `@vkid/captcha` 2.0.0 получен из npm от автора VK ID <devsupport@corp.vk.com>; локальная UMD-сборка скопирована без изменения, вместе с MIT LICENSE и SHA-256 в `cmd/blink/ui/vendor/UPSTREAM.json`. Адаптер `captcha.js` только монтирует visible/block challenge по URL ядра и передаёт одноразовый ответ обратно; никакого решателя нет.
 
 Дизайн основан на фактических мобильных `BlinkTheme.swift` / `BlinkStyle.java`; Windows HTML/CSS, векторы и EXE-иконка написаны в этом репозитории. `tools/make-icon.py` воспроизводит исходную иконку, не использует чужие растровые изображения. Скриншоты docs сняты с синтетическими данными на тех же frontend assets.
+
+## Флаги 0.2.1
+
+`flag-icons` 7.5.0: неизменённые `flags/4x3/[a-z][a-z].svg` из npm-архива. MIT-лицензия и SHA-256 архива находятся в `cmd/blink/ui/vendor/FLAG-ICONS-{LICENSE.txt,UPSTREAM.json}`. Источник: https://github.com/lipis/flag-icons. PNG, внешние CDN и генерация изображения не используются.

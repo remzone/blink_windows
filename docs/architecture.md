@@ -1,4 +1,4 @@
-# Архитектура 0.2.0
+# Архитектура 0.2.1
 
 `cmd/blink/main_windows.go` — desktop host Wails 2.17.1/WebView2 и lifecycle/controller. `cmd/blink/ui` — встроенные HTML/CSS/JS, SVG-иконки и закреплённый официальный VK CAPTCHA SDK. Node не нужен для сборки готовых assets. Привилегированные Go bindings разрешены только локальному origin приложения; удалённый CAPTCHA iframe их не получает.
 
@@ -46,3 +46,12 @@ Vokop v3 и `routing` преобразуются в `mobile.RoutingPolicy`, ст
 Отдельная CGO-free сборка `GOARCH=386`, собственный manifest resource и x86 DLL Wintun. Структуры Windows API/DPAPI используются из x/sys, WebView2 — через закреплённую версию go-webview2 с x86 bindings. На x64 Windows тест x86 исполняется в WOW64; он не заменяет проверку отдельной 32-битной ОС.
 
 Официальные API: [Wintun](https://www.wintun.net/), [Wails options](https://v2.wails.io/docs/reference/options/), [VK CAPTCHA SDK](https://www.npmjs.com/package/@vkid/captcha), [NRPT](https://learn.microsoft.com/en-us/powershell/module/dnsclient/add-dnsclientnrptrule), [Firewall](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule), [Playwright WebView2](https://playwright.dev/docs/webview2).
+
+
+## Определение исходного интерфейса (0.2.1)
+
+`GetIPForwardTable2` перечисляет default routes отдельно для IPv4/IPv6. `GetIfEntry2` и `GetIpInterfaceEntry` проверяют активность адаптера, имя и метрику. Кандидаты без индекса, отключённые и собственный Blink исключаются. Сравнение использует сумму route metric + interface metric в uint64; при равенстве — меньший индекс. При отсутствии IPv4-маршрута подключение останавливается с понятным сообщением до создания туннеля. Успешный IPv6 lookup используется для защиты IPv6-сокетов, при отсутствии — прежний fallback на IPv4 index.
+
+В 0.2.0 индекс разбирался через `fmt.Sscan` из `powershell.exe -EncodedCommand` + `CombinedOutput`. Такой вывод может включать CLIXML/progress из stderr или зависеть от console encoding. Скриншот ошибки подтверждал сбой разбора, но конкретный stdout/stderr того компьютера не получен. Новый путь вообще не читает текст консоли. Оставшийся PowerShell настраивает/очищает только сетевые правила; progress отключён, stdout отделён от stderr.
+
+Описание структуры и метрик: [Microsoft MIB_IPFORWARD_ROW2](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipforward_row2). Windows API не проверен на пользовательском устройстве в этой среде; для него добавлены read-only Windows tests.
