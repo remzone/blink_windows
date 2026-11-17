@@ -1,0 +1,6 @@
+{
+  "total": 4,
+  "supported": 4,
+  "rejected": 0,
+  "note": "Legacy Unsupported labels are historical; the current shared parser supports these four fixtures."
+}

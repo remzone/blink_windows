@@ -1,0 +1,11 @@
+/work/
+/dist/
+*.exe
+*.dll
+*.zip
+*.private
+*.dpapi
+*.syso
+*.aar
+*.jar
+__pycache__/
