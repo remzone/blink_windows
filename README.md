@@ -12,6 +12,8 @@ Windows-клиент на общем Go-ядре [Blink iOS](https://github.com/
 
 Требуются **Windows 10/11 x64** либо **Windows 10 x86**, права администратора и [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/). Windows 7/8 не поддерживаются. Windows 11 выпускается для 64-битных систем; x86-приложение также может запускаться в WOW64 на x64 Windows.
 
+В текущем запуске Windows CI не стартовал из-за billing-блокировки аккаунта GitHub, поэтому удалённые artifacts пока не созданы. Локально собраны оба ZIP; результат и границы проверки описаны в [validation.md](docs/validation.md).
+
 1. Возьмите соответствующий ZIP из artifacts [GitHub Actions](https://github.com/remzone/blink_windows/actions) или соберите его по инструкции ниже.
 2. Распакуйте ZIP целиком. `Blink.exe` и `wintun.dll` должны лежать рядом.
 3. Запустите EXE и подтвердите UAC для драйвера и настройки сети.

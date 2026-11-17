@@ -25,7 +25,7 @@ Workflow запускается при push в main, pull request или вру�
 4. Сборку и упаковку обоих EXE.
 5. Запуск настоящих desktop EXE с WebView2 и Playwright через CDP: получение Go Snapshot, импорт синтетического VLESS без подключения, DPAPI-файл без открытого UUID, сохранение настроек и screenshot.
 
-Smoke-сценарий **не стартует VPN и не меняет маршруты/Firewall**. Порт remote debugging задаётся только окружением теста; в обычном запуске приложение его не включает. Наличие workflow не означает успешного исполнения: итог конкретного запуска следует смотреть в Actions. На момент обновления документации удалённый результат ещё не подтверждён.
+Smoke-сценарий **не стартует VPN и не меняет маршруты/Firewall**. Порт remote debugging задаётся только окружением теста; в обычном запуске приложение его не включает. [Первый запуск CI](https://github.com/remzone/blink_windows/actions/runs/44128014115) завершился **до старта runner**: GitHub сообщил `The job was not started because your account is locked due to a billing issue.` Ни одного Windows test/smoke step в этом запуске не выполнялось, CI artifacts не созданы. Это ограничение аккаунта, не результат компиляции или теста. После устранения billing-блокировки workflow можно запустить вручную; успешного Windows-результата пока нет.
 
 ## Как воспроизвести frontend-тест
 
